@@ -1,0 +1,26 @@
+Motorcycle Wheelie Controller tests
+===================================
+
+The Unity suite in `test_controller_core` covers the hardware-independent
+controller state machine and persistent-settings validation.
+
+Run the complete hardware-independent suite on this computer (no board):
+
+    pio test -e native
+
+Compile the on-device version without touching a connected board:
+
+    pio test -e seeed_xiao_esp32s3 --without-uploading --without-testing
+
+Run the tests on a connected XIAO ESP32-S3:
+
+    pio test -e seeed_xiao_esp32s3
+
+The on-device command temporarily uploads the test firmware. Upload the normal
+application again afterward with:
+
+    pio run -e seeed_xiao_esp32s3 --target upload
+
+The native tests exercise the same portable helpers used by `src/main.cpp` for
+wheelie transitions, adaptive angle processing, warning hysteresis, light
+patterns, fades, settings validation, and rollover-safe timing.

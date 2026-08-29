@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible firmware, simulator, or dashboard problem
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve the controller. Do not include credentials or private device data.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [Firmware, MPU6050 / calibration, OLED, Lighting output, Wi-Fi dashboard, Desktop simulator, Build / CI]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      placeholder: v0.11.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include expected behavior and exact reproduction steps.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or screenshots
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I have stated whether this can unexpectedly activate or prevent the lighting output.
+          required: true

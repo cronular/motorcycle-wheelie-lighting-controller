@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wheelie Controller Lab</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="kicker">XIAO ESP32-S3 · desktop simulation</p>
+        <h1>Wheelie Controller Lab</h1>
+      </div>
+      <div class="run-state"><span id="runDot"></span><strong id="runLabel">RUNNING</strong><small id="simClock">0.00 s</small></div>
+    </header>
+
+    <section class="scenario-strip" aria-label="Simulation scenarios">
+      <button data-scenario="manual" class="active">Manual bench</button>
+      <button data-scenario="wheelie">Clean wheelie</button>
+      <button data-scenario="blip">Short blip</button>
+      <button data-scenario="hill">Hill + wheelie</button>
+      <button data-scenario="warning">High-angle warning</button>
+      <button data-scenario="fault">IMU disconnect</button>
+      <button id="playPause" class="accent">Pause</button>
+      <button id="resetSim">Reset</button>
+    </section>
+
+    <section class="layout">
+      <article class="card hero">
+        <div class="card-title"><div><span>Virtual motorcycle</span><h2 id="stateHeading">STANDBY</h2></div><div id="warningBadge" class="warning-badge">ANGLE WARNING</div></div>
+        <div class="stage">
+          <div class="sky-grid"></div><div class="horizon"></div><div class="road"></div>
+          <div id="bike" class="bike" aria-label="Motorcycle attitude graphic">
+            <div class="wheel rear"></div><div class="wheel front"></div>
+            <div class="frame"></div><div class="tank"></div><div class="seat"></div><div class="fork"></div>
+          </div>
+          <div class="angle-readout"><strong id="pitchValue">+0.0°</strong><span>trigger pitch</span></div>
+        </div>
+        <div class="telemetry-grid">
+          <div><span>Absolute</span><strong id="absoluteValue">+0.0°</strong></div>
+          <div><span>Baseline</span><strong id="baselineValue">+0.0°</strong></div>
+          <div><span>Pitch rate</span><strong id="gyroValue">+0.0°/s</strong></div>
+          <div><span>Linear +G</span><strong id="gValue">+0.00 g</strong></div>
+          <div><span>Output</span><strong id="outputValue">0%</strong></div>
+        </div>
+      </article>
+
+      <aside class="card components">
+        <div class="card-title"><div><span>Emulated components</span><h2>Bench status</h2></div></div>
+        <div class="component ok" id="xiaoComponent"><i></i><div><strong>XIAO ESP32-S3</strong><span>Loop and virtual clock active</span></div><b>OK</b></div>
+        <div class="component ok" id="imuComponent"><i></i><div><strong>MPU6050</strong><span id="imuDetail">I²C 0x68 · samples valid</span></div><b id="imuStatus">OK</b></div>
+        <div class="component ok"><i></i><div><strong>SSD1306 OLED</strong><span>128 × 64 · I²C display</span></div><b>OK</b></div>
+        <div class="component" id="pwmComponent"><i></i><div><strong>MOSFET / PWM</strong><span id="pwmDetail">GPIO D0 · 0 / 255</span></div><b id="pwmStatus">OFF</b></div>
+        <div class="light-fixture"><span>Virtual lighting output</span><div id="lamp" class="lamp"></div></div>
+        <div class="mode-buttons"><button id="armButton" class="safe">Arm</button><button id="standbyButton">Standby</button></div>
+        <label class="switch-row"><span>MPU6050 connected</span><input id="imuHealthy" type="checkbox" checked><i></i></label>
+      </aside>
+
+      <article class="card controls">
+        <div class="card-title"><div><span>Sensor injection</span><h2>Live inputs</h2></div><span class="hint">Moving a slider selects Manual bench</span></div>
+        <label>Absolute pitch <output id="pitchOut">0.0°</output><input id="pitchInput" type="range" min="-20" max="75" step="0.1" value="0"></label>
+        <label>Gyroscope pitch rate <output id="gyroOut">0.0°/s</output><input id="gyroInput" type="range" min="-120" max="120" step="1" value="0"></label>
+        <label>Dynamic linear acceleration <output id="gOut">0.00 g</output><input id="gInput" type="range" min="0" max="2.5" step="0.01" value="0"></label>
+        <div class="button-emulation"><span>Physical button gestures</span><button data-gesture="single">1× Page</button><button data-gesture="double">2× Angle</button><button data-gesture="triple">3× Wi-Fi</button><button data-gesture="hold">Hold Arm</button></div>
+      </article>
+
+      <article class="card oled-card">
+        <div class="card-title"><div><span>SSD1306 output</span><h2>Virtual OLED</h2></div><b id="oledPage">PAGE 1/4</b></div>
+        <pre id="oled" class="oled" aria-label="OLED text display"></pre>
+      </article>
+
+      <article class="card settings-card">
+        <div class="card-title"><div><span>Controller configuration</span><h2>Detection settings</h2></div><button id="defaultsButton" class="small">Defaults</button></div>
+        <div class="settings-grid">
+          <label>Angle mode<select id="angleMode"><option value="absolute">Absolute</option><option value="adaptive">Adaptive</option></select></label>
+          <label>Wheelie pattern<select id="wheeliePattern"><option value="solid">Solid</option><option value="slow">Slow pulse</option><option value="fast">Fast pulse</option><option value="strobe">Strobe</option><option value="off">Off</option></select></label>
+          <label>Trigger angle<input id="triggerAngle" type="number" min="5" max="70" step="0.5" value="20"></label>
+          <label>Reset angle<input id="resetAngle" type="number" min="0" max="69" step="0.5" value="10"></label>
+          <label>Trigger hold (ms)<input id="triggerHold" type="number" min="0" max="5000" step="10" value="150"></label>
+          <label>Minimum on (ms)<input id="minimumOn" type="number" min="0" max="15000" step="50" value="1000"></label>
+          <label>Brightness (%)<input id="brightness" type="number" min="1" max="100" value="100"></label>
+          <label>Adaptive time constant (s)<input id="adaptiveTau" type="number" min="0.5" max="60" step="0.5" value="4"></label>
+          <label>Baseline freeze rate (°/s)<input id="freezeRate" type="number" min="1" max="100" step="0.5" value="8"></label>
+          <label>Warning angle<input id="warningAngle" type="number" min="5" max="85" step="0.5" value="45"></label>
+          <label>Warning reset<input id="warningReset" type="number" min="0" max="84" step="0.5" value="40"></label>
+          <label>Warning pitch rate (°/s)<input id="warningRate" type="number" min="0" max="250" step="1" value="45"></label>
+        </div>
+      </article>
+
+      <article class="card timeline-card">
+        <div class="card-title"><div><span>Runtime trace</span><h2>Events</h2></div><button id="clearLog" class="small">Clear</button></div>
+        <div id="eventLog" class="event-log"></div>
+      </article>
+    </section>
+    <footer>This simulator executes the controller at 100 Hz. Native C++ tests remain the source of truth for shared production logic.</footer>
+  </main>
+  <script src="simulator.js"></script>
+</body>
+</html>

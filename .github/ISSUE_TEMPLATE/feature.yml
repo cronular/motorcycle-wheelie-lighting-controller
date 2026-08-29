@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a focused controller, simulator, or dashboard improvement
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What rider or development need would this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware impact
+      options: [None, Existing components only, New or changed hardware, Unsure]
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and failure behavior
+      description: Explain the desired behavior during sensor, power, or communication failure.

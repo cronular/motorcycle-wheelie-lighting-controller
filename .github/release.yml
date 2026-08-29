@@ -1,0 +1,14 @@
+changelog:
+  exclude:
+    labels: ["skip-changelog"]
+  categories:
+    - title: "🚨 Safety and reliability"
+      labels: ["safety", "reliability"]
+    - title: "✨ Features"
+      labels: ["enhancement", "feature"]
+    - title: "🐛 Fixes"
+      labels: ["bug", "fix"]
+    - title: "🧰 Development"
+      labels: ["testing", "tooling", "dependencies", "documentation"]
+    - title: "Other changes"
+      labels: ["*"]

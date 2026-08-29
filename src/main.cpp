@@ -1,0 +1,2297 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+#include <U8x8lib.h>
+#include <esp_arduino_version.h>
+#include <esp_system.h>
+#include <esp_ota_ops.h>
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <Update.h>
+#include "controller_core.h"
+
+// =====================================================
+// FINAL-HARDWARE PIN ASSIGNMENTS
+// =====================================================
+
+#define I2C_SDA_PIN       D4
+#define I2C_SCL_PIN       D5
+#define USER_BUTTON_PIN   D1
+// D6 is GPIO43/UART TX on the XIAO ESP32-S3 and pulses during ROM boot.
+// D0/GPIO1 stays suitable for the MOSFET trigger's external pulldown.
+#define OUTPUT1_PWM_PIN   D0
+
+// =====================================================
+// FIRMWARE
+// =====================================================
+
+constexpr const char* FIRMWARE_VERSION = "v0.11.0";
+
+// =====================================================
+// WIFI / WEB
+// =====================================================
+
+constexpr const char* WIFI_AP_SSID_PREFIX = "wheelie_controller_";
+constexpr const char* DEFAULT_WIFI_AP_PASSWORD = "wheeliectrl";
+constexpr const char* MDNS_HOSTNAME = "wheelie";
+constexpr uint16_t DNS_PORT = 53;
+
+// Password is stored in NVS. The physical button can restore the default.
+String wifiApPassword = DEFAULT_WIFI_AP_PASSWORD;
+String wifiApSsid;
+
+IPAddress AP_IP(192, 168, 4, 1);
+IPAddress AP_GATEWAY(192, 168, 4, 1);
+IPAddress AP_SUBNET(255, 255, 255, 0);
+
+WebServer server(80);
+DNSServer dnsServer;
+
+bool dnsHealthy = false;
+bool wifiHealthy = false;
+bool mdnsHealthy = false;
+bool accessPointEnabled = false;
+bool webRoutesRegistered = false;
+String writeToken;
+
+// A password change needs to let the HTTP response leave before the AP
+// disconnects. The main loop performs the restart after this delay.
+bool accessPointRestartPending = false;
+unsigned long accessPointRestartAtMs = 0;
+unsigned long wifiPasswordResetNoticeUntil = 0;
+
+// =====================================================
+// PERSISTENT SETTINGS
+// =====================================================
+
+Preferences preferences;
+
+ControllerSettings settings;
+
+// =====================================================
+// OLED
+// Generic 128x64 SSD1306 I2C display, including
+// GME12864-12 and the development expansion-board OLED.
+//
+// IMPORTANT: U8x8 initializes the shared I2C bus.
+// DO NOT call Wire.begin() separately.
+// =====================================================
+
+U8X8_SSD1306_128X64_NONAME_HW_I2C oled(
+    U8X8_PIN_NONE,
+    I2C_SCL_PIN,
+    I2C_SDA_PIN
+);
+
+constexpr unsigned long DISPLAY_REFRESH_MS = 100;
+
+// =====================================================
+// PWM OUTPUT
+// =====================================================
+
+constexpr uint32_t PWM_FREQUENCY = 1000;
+constexpr uint8_t PWM_RESOLUTION = 8;
+constexpr uint8_t PWM_CHANNEL = 0; // Arduino-ESP32 2.x only
+
+uint8_t outputBrightness = 0;      // actual PWM value
+uint8_t outputTarget = 0;          // requested PWM value
+uint8_t fadeStartBrightness = 0;
+unsigned long fadeStartMs = 0;
+uint32_t activeFadeDurationMs = 0;
+bool fadeActive = false;
+
+// Manual output test is only available in STANDBY.
+constexpr unsigned long MANUAL_TEST_TIMEOUT_MS = 10000;
+bool manualTestActive = false;
+unsigned long manualTestStartMs = 0;
+
+// =====================================================
+// MPU6050
+// =====================================================
+
+constexpr uint8_t MPU_ADDR = 0x68;
+constexpr uint8_t PWR_MGMT_1 = 0x6B;
+constexpr uint8_t CONFIG_REG = 0x1A;
+constexpr uint8_t GYRO_CONFIG = 0x1B;
+constexpr uint8_t ACCEL_CONFIG = 0x1C;
+constexpr uint8_t ACCEL_XOUT_H = 0x3B;
+
+// v0.10 uses +/-4g instead of +/-2g so the live G-load display
+// has useful headroom for bumps, launches, and landings.
+constexpr uint8_t ACCEL_RANGE_CONFIG_VALUE = 0x08; // AFS_SEL=1, +/-4g
+constexpr float ACCEL_LSB_PER_G = 8192.0f;
+
+// =====================================================
+// PITCH FILTER
+// =====================================================
+
+constexpr float FILTER_ALPHA = 0.98f;
+constexpr float PITCH_SIGN = -1.0f; // front rising = positive
+
+// =====================================================
+// IMU CALIBRATION
+// =====================================================
+
+// Calibration is intentionally tolerant of normal engine-idle vibration.
+// It averages the acceleration vector, not per-sample pitch angles.
+constexpr int CALIBRATION_ACCEPTED_SAMPLES = 1500;
+constexpr unsigned long CALIBRATION_TIMEOUT_MS = 10000;
+constexpr uint8_t INITIAL_CALIBRATION_DELAY_SECONDS = 3;
+constexpr unsigned long CALIBRATION_FLASH_MS = 200;
+constexpr float CAL_ACCEL_MAG_MIN_G = 0.65f;
+constexpr float CAL_ACCEL_MAG_MAX_G = 1.35f;
+constexpr float CAL_MAX_GYRO_AXIS_DPS = 30.0f;
+
+float calibrationAccelNoiseRms = 0.0f;
+float calibrationGyroNoiseRms = 0.0f;
+bool calibrationHighVibration = false;
+
+// =====================================================
+// BUTTON
+// =====================================================
+
+constexpr unsigned long BUTTON_DEBOUNCE_MS = 35;
+constexpr unsigned long BUTTON_LONG_PRESS_MS = 1500;
+constexpr unsigned long BUTTON_WIFI_PASSWORD_RESET_MS = 30000;
+constexpr unsigned long BUTTON_MULTI_TAP_MS = 400;
+
+bool lastRawButtonState = HIGH;
+bool debouncedButtonState = HIGH;
+unsigned long lastButtonChangeTime = 0;
+unsigned long buttonPressStartTime = 0;
+bool longPressHandled = false;
+bool longPressGestureActive = false;
+
+// Short taps are collected into one gesture window:
+// 1 tap = next OLED page
+// 2 taps = ABSOLUTE <-> ADAPTIVE
+// 3 taps = Wi-Fi access point ON/OFF
+uint8_t shortTapCount = 0;
+unsigned long lastTapReleaseTime = 0;
+
+// =====================================================
+// CONTROLLER TYPES
+// =====================================================
+
+struct MPUData {
+    float ax;
+    float ay;
+    float az;
+    float gx;
+    float gy;
+    float gz;
+};
+
+enum class OperatingMode {
+    ARMED,
+    STANDBY
+};
+
+enum class RotationAxis : uint8_t {
+    X = 0,
+    Y = 1,
+    Z = 2
+};
+
+enum class DisplayPage {
+    STATUS,
+    SETTINGS,
+    NETWORK,
+    DIAGNOSTICS
+};
+
+// =====================================================
+// GLOBAL CONTROLLER STATE
+// =====================================================
+
+RotationAxis rotationAxis = RotationAxis::Y;
+float gyroAxisBias = 0.0f;
+float pitch = 0.0f;
+float pitchZero = 0.0f;
+
+// Absolute pitch is relative to startup/calibration zero.
+float currentAbsolutePitch = 0.0f;
+
+// Adaptive baseline slowly follows terrain in ADAPTIVE mode.
+float adaptiveBaseline = 0.0f;
+
+// This is the angle actually sent to the wheelie detector.
+float currentTriggerPitch = 0.0f;
+
+float currentGyroRate = 0.0f;
+
+// Live acceleration telemetry. v0.11 reports +G as dynamic linear
+// acceleration with the gravity vector removed, so a stationary bike
+// settles at approximately +0.00 g instead of ~1 g.
+float currentAccelX = 0.0f;
+float currentAccelY = 0.0f;
+float currentAccelZ = 1.0f;
+float currentGLoad = 0.0f;
+
+// Calibration normalizes the particular MPU's measured resting gravity
+// magnitude (for example 1.12 raw g) back to 1.00 g.
+float accelScaleCorrection = 1.0f;
+float calibrationRestMagnitudeRaw = 1.0f;
+
+// Low-pass gravity estimate in sensor coordinates. Subtracting this from
+// instantaneous acceleration produces a useful launch/bump +G estimate.
+float gravityEstimateX = 0.0f;
+float gravityEstimateY = 0.0f;
+float gravityEstimateZ = 1.0f;
+constexpr float GRAVITY_TRACK_TIME_SEC = 1.50f;
+constexpr float GLOAD_SMOOTHING_TIME_SEC = 0.08f;
+constexpr float GLOAD_DEADBAND_G = 0.015f;
+
+// Session peaks (not persisted). They reset at calibration or from the
+// dashboard's individual reset buttons.
+float highestAngle = 0.0f;
+float highestGLoad = 0.0f;
+
+bool adaptiveBaselineFrozen = false;
+
+bool imuHealthy = false;
+int imuFailureCount = 0;
+int imuRecoveryCount = 0;
+constexpr int IMU_FAILURE_LIMIT = 5;
+constexpr int IMU_RECOVERY_LIMIT = 20;
+
+unsigned long lastMicros = 0;
+unsigned long triggerStartTime = 0;
+unsigned long wheelieStartTime = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastSerialUpdate = 0;
+
+ControllerState controllerState = ControllerState::NORMAL;
+bool highAngleWarningActive = false;
+unsigned long completedWheelieCount = 0;
+unsigned long lastWheelieDurationMs = 0;
+float lastWheeliePeakAngle = 0.0f;
+float lastWheeliePeakG = 0.0f;
+float activeWheeliePeakAngle = 0.0f;
+float activeWheeliePeakG = 0.0f;
+OperatingMode operatingMode = OperatingMode::STANDBY;
+DisplayPage displayPage = DisplayPage::STATUS;
+
+bool displayDirty = true;
+
+// =====================================================
+// FORWARD DECLARATIONS
+// =====================================================
+
+void forceOutputOff();
+void setOutputTarget(uint8_t target, bool immediate = false);
+void setOperatingMode(OperatingMode mode);
+bool calibrateMPU();
+void startAccessPoint();
+void stopAccessPoint();
+void toggleAccessPointFromButton();
+void scheduleAccessPointRestart(unsigned long delayMs = 750);
+void resetWiFiPasswordToDefault();
+void flashCalibrationComplete();
+
+// =====================================================
+// STRING HELPERS
+// =====================================================
+
+const char* getStateName() {
+    switch (controllerState) {
+        case ControllerState::NORMAL: return "NORMAL";
+        case ControllerState::TRIGGER_PENDING: return "PENDING";
+        case ControllerState::WHEELIE: return "WHEELIE";
+    }
+    return "UNKNOWN";
+}
+
+const char* getModeName() {
+    return operatingMode == OperatingMode::ARMED ? "ARMED" : "STANDBY";
+}
+
+const char* getAngleModeName() {
+    return settings.angleMode == AngleMode::ADAPTIVE ? "ADAPTIVE" : "ABSOLUTE";
+}
+
+// =====================================================
+// SETTINGS / NVS
+// =====================================================
+
+void validateSettings() {
+    validateControllerSettings(settings);
+}
+
+const char* getRotationAxisName() {
+    switch (rotationAxis) {
+        case RotationAxis::X: return "X";
+        case RotationAxis::Y: return "Y";
+        case RotationAxis::Z: return "Z";
+    }
+    return "Y";
+}
+
+void loadSettings() {
+    preferences.begin("wheelie", true);
+
+    settings.triggerAngle = preferences.getFloat("trig", 20.0f);
+    settings.resetAngle = preferences.getFloat("reset", 10.0f);
+    settings.triggerHoldMs = preferences.getUInt("hold", 150);
+    settings.minimumOnTimeMs = preferences.getUInt("minon", 1000);
+    settings.brightness = preferences.getUChar("bright", 255);
+    settings.fadeMs = preferences.getUInt("fade", 200);
+    settings.bootArmed = preferences.getBool("bootarm", false);
+
+    settings.angleMode = static_cast<AngleMode>(
+        preferences.getUChar("angmode", static_cast<uint8_t>(AngleMode::ABSOLUTE))
+    );
+    settings.adaptiveTimeConstantSec = preferences.getFloat("adptau", 4.0f);
+    settings.adaptiveFreezeRateDegSec = preferences.getFloat("adpfrz", 8.0f);
+    settings.warningAngle = preferences.getFloat("warnang", 45.0f);
+    settings.warningResetAngle = preferences.getFloat("warnrst", 40.0f);
+    settings.warningPitchRateDegSec = preferences.getFloat("warnrate", 45.0f);
+    settings.wheeliePattern = static_cast<LightPattern>(preferences.getUChar("whlpat", 1));
+    settings.warningPattern = static_cast<LightPattern>(preferences.getUChar("wrnpat", 4));
+    settings.warningBrightness = preferences.getUChar("wrnbright", 255);
+    rotationAxis = static_cast<RotationAxis>(preferences.getUChar("rotaxis", 1));
+    wifiApPassword = preferences.getString("wifipass", DEFAULT_WIFI_AP_PASSWORD);
+    wifiApSsid = preferences.getString("apssid", "");
+
+    preferences.end();
+
+    // Generate the AP identity only once. NVS survives ordinary restarts and
+    // OTA firmware updates, so paired devices continue to recognize the AP.
+    if (wifiApSsid.length() == 0) {
+        char generatedSsid[33];
+        snprintf(generatedSsid, sizeof(generatedSsid), "%s%04lu",
+                 WIFI_AP_SSID_PREFIX,
+                 (unsigned long)(esp_random() % 10000));
+        wifiApSsid = generatedSsid;
+
+        preferences.begin("wheelie", false);
+        preferences.putString("apssid", wifiApSsid);
+        preferences.end();
+        Serial.printf("Generated persistent Wi-Fi SSID: %s\n", wifiApSsid.c_str());
+    }
+
+    if (wifiApPassword.length() < 8 || wifiApPassword.length() > 63) {
+        wifiApPassword = DEFAULT_WIFI_AP_PASSWORD;
+    }
+    if (rotationAxis != RotationAxis::X &&
+        rotationAxis != RotationAxis::Y &&
+        rotationAxis != RotationAxis::Z) {
+        rotationAxis = RotationAxis::Y;
+    }
+    validateSettings();
+}
+
+void saveSettings() {
+    preferences.begin("wheelie", false);
+
+    preferences.putFloat("trig", settings.triggerAngle);
+    preferences.putFloat("reset", settings.resetAngle);
+    preferences.putUInt("hold", settings.triggerHoldMs);
+    preferences.putUInt("minon", settings.minimumOnTimeMs);
+    preferences.putUChar("bright", settings.brightness);
+    preferences.putUInt("fade", settings.fadeMs);
+    preferences.putBool("bootarm", settings.bootArmed);
+
+    preferences.putUChar("angmode", static_cast<uint8_t>(settings.angleMode));
+    preferences.putFloat("adptau", settings.adaptiveTimeConstantSec);
+    preferences.putFloat("adpfrz", settings.adaptiveFreezeRateDegSec);
+    preferences.putFloat("warnang", settings.warningAngle);
+    preferences.putFloat("warnrst", settings.warningResetAngle);
+    preferences.putFloat("warnrate", settings.warningPitchRateDegSec);
+    preferences.putUChar("whlpat", static_cast<uint8_t>(settings.wheeliePattern));
+    preferences.putUChar("wrnpat", static_cast<uint8_t>(settings.warningPattern));
+    preferences.putUChar("wrnbright", settings.warningBrightness);
+    preferences.putUChar("rotaxis", static_cast<uint8_t>(rotationAxis));
+    preferences.putString("wifipass", wifiApPassword);
+
+    preferences.end();
+    Serial.println("Settings saved to NVS");
+}
+
+// =====================================================
+// MPU6050 LOW-LEVEL FUNCTIONS
+// =====================================================
+
+void writeMPURegister(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    Wire.endTransmission();
+}
+
+bool readMPU(MPUData &data) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(ACCEL_XOUT_H);
+
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    Wire.requestFrom(MPU_ADDR, (size_t)14, true);
+
+    if (Wire.available() != 14) {
+        return false;
+    }
+
+    int16_t rawAx = (Wire.read() << 8) | Wire.read();
+    int16_t rawAy = (Wire.read() << 8) | Wire.read();
+    int16_t rawAz = (Wire.read() << 8) | Wire.read();
+
+    Wire.read();
+    Wire.read(); // temperature unused
+
+    int16_t rawGx = (Wire.read() << 8) | Wire.read();
+    int16_t rawGy = (Wire.read() << 8) | Wire.read();
+    int16_t rawGz = (Wire.read() << 8) | Wire.read();
+
+    data.ax = rawAx / ACCEL_LSB_PER_G;
+    data.ay = rawAy / ACCEL_LSB_PER_G;
+    data.az = rawAz / ACCEL_LSB_PER_G;
+
+    data.gx = rawGx / 131.0f;
+    data.gy = rawGy / 131.0f;
+    data.gz = rawGz / 131.0f;
+
+    return true;
+}
+
+float getSelectedGyroRate(const MPUData &data) {
+    switch (rotationAxis) {
+        case RotationAxis::X: return data.gx;
+        case RotationAxis::Y: return data.gy;
+        case RotationAxis::Z: return data.gz;
+    }
+    return data.gy;
+}
+
+float calculateAccelPitchFromVector(float ax, float ay, float az) {
+    switch (rotationAxis) {
+        case RotationAxis::X:
+            return atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI;
+        case RotationAxis::Y:
+            // Preserve the original/default mounting calculation.
+            return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+        case RotationAxis::Z:
+            // When Z is the physical pitch axis, gravity rotates in the XY
+            // plane. Startup calibration supplies the arbitrary level zero.
+            return atan2(ax, ay) * 180.0f / PI;
+    }
+    return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+}
+
+float calculateAccelPitch(const MPUData &data) {
+    return calculateAccelPitchFromVector(data.ax, data.ay, data.az);
+}
+
+// =====================================================
+// PWM OUTPUT / FADES
+// =====================================================
+
+void writePWM(uint8_t brightness) {
+    outputBrightness = brightness;
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWrite(OUTPUT1_PWM_PIN, brightness);
+#else
+    ledcWrite(PWM_CHANNEL, brightness);
+#endif
+}
+
+void initializePWM() {
+    pinMode(OUTPUT1_PWM_PIN, OUTPUT);
+    digitalWrite(OUTPUT1_PWM_PIN, LOW);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    if (!ledcAttach(OUTPUT1_PWM_PIN, PWM_FREQUENCY, PWM_RESOLUTION)) {
+        Serial.println("ERROR: PWM initialization failed");
+        return;
+    }
+    ledcWrite(OUTPUT1_PWM_PIN, 0);
+#else
+    ledcSetup(PWM_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+    ledcAttachPin(OUTPUT1_PWM_PIN, PWM_CHANNEL);
+    ledcWrite(PWM_CHANNEL, 0);
+#endif
+
+    outputBrightness = 0;
+    outputTarget = 0;
+    fadeActive = false;
+}
+
+void forceOutputOff() {
+    manualTestActive = false;
+    fadeActive = false;
+    outputTarget = 0;
+    writePWM(0);
+}
+
+void flashCalibrationComplete() {
+    // Bypass the configured fade so both confirmation flashes are distinct.
+    for (uint8_t flash = 0; flash < 2; ++flash) {
+        writePWM(255);
+        delay(CALIBRATION_FLASH_MS);
+        writePWM(0);
+        delay(CALIBRATION_FLASH_MS);
+    }
+    outputTarget = 0;
+    fadeActive = false;
+}
+
+void setOutputTarget(uint8_t target, bool immediate) {
+    if (target == outputTarget && !immediate) {
+        return;
+    }
+
+    outputTarget = target;
+
+    if (immediate || settings.fadeMs == 0) {
+        fadeActive = false;
+        writePWM(target);
+        return;
+    }
+
+    fadeStartBrightness = outputBrightness;
+    fadeStartMs = millis();
+    activeFadeDurationMs = settings.fadeMs;
+    fadeActive = true;
+}
+
+void updateOutputFade() {
+    if (!fadeActive) {
+        return;
+    }
+
+    unsigned long elapsed = millis() - fadeStartMs;
+
+    if (elapsed >= activeFadeDurationMs || activeFadeDurationMs == 0) {
+        fadeActive = false;
+        writePWM(outputTarget);
+        return;
+    }
+
+    writePWM(calculateFadeBrightness(
+        fadeStartBrightness, outputTarget, elapsed, activeFadeDurationMs));
+}
+
+void updateManualOutputTest() {
+    if (!manualTestActive) {
+        return;
+    }
+
+    if (
+        operatingMode != OperatingMode::STANDBY ||
+        (millis() - manualTestStartMs) >= MANUAL_TEST_TIMEOUT_MS
+    ) {
+        manualTestActive = false;
+        setOutputTarget(0);
+        displayDirty = true;
+    }
+}
+
+// =====================================================
+// OLED HELPERS
+// =====================================================
+
+void oledPrintRow(uint8_t row, const char* text) {
+    char line[17];
+    memset(line, ' ', 16);
+    line[16] = '\0';
+
+    size_t len = strlen(text);
+    if (len > 16) len = 16;
+    memcpy(line, text, len);
+
+    oled.drawString(0, row, line);
+}
+
+void drawBootScreen() {
+    oled.clearDisplay();
+    oledPrintRow(0, "WHEELIE CTRL");
+    oledPrintRow(2, "BOOTING...");
+    oledPrintRow(4, FIRMWARE_VERSION);
+}
+
+void drawCalibrationScreen(const char* line5 = "Please wait...") {
+    oled.clearDisplay();
+    oledPrintRow(0, "IMU CALIBRATION");
+    oledPrintRow(2, "Keep bike still");
+    oledPrintRow(3, "Idle vibration OK");
+    oledPrintRow(5, line5);
+}
+
+void drawStandbyScreen() {
+    char line[17];
+
+    oledPrintRow(0, "    STANDBY");
+    oledPrintRow(1, "----------------");
+
+    if (manualTestActive) {
+        int percent = (outputBrightness * 100) / 255;
+        snprintf(line, sizeof(line), "TEST OUT:%d%%", percent);
+        oledPrintRow(2, line);
+    } else {
+        oledPrintRow(2, "OUTPUT: OFF");
+    }
+
+    snprintf(line, sizeof(line), "PITCH:%+.1f", currentTriggerPitch);
+    oledPrintRow(4, line);
+    oledPrintRow(6, "Hold 1.5s ARM");
+    oledPrintRow(7, "30s WiFi reset");
+}
+
+void drawStatusPage() {
+    char line[17];
+
+    oledPrintRow(0, "WHEELIE CTRL 1/4");
+    oledPrintRow(1, "MODE: ARMED");
+
+    snprintf(line, sizeof(line), "PITCH:%+.1f deg", currentTriggerPitch);
+    oledPrintRow(2, line);
+
+    snprintf(line, sizeof(line), "STATE:%s", getStateName());
+    oledPrintRow(3, line);
+
+    int outputPercent = (outputBrightness * 100) / 255;
+    snprintf(line, sizeof(line), "OUTPUT:%d%%", outputPercent);
+    oledPrintRow(4, line);
+
+    snprintf(line, sizeof(line), "ANGLE:%s", settings.angleMode == AngleMode::ADAPTIVE ? "ADAPT" : "ABS");
+    oledPrintRow(5, line);
+
+    oledPrintRow(6, "1xPg 2xAng 3xAP");
+    oledPrintRow(7, "Hold=Arm 30sPwd");
+}
+
+void drawSettingsPage() {
+    char line[17];
+
+    oledPrintRow(0, "SETTINGS     2/4");
+    oledPrintRow(1, "----------------");
+
+    snprintf(line, sizeof(line), "TRIG:%.1f deg", settings.triggerAngle);
+    oledPrintRow(2, line);
+
+    snprintf(line, sizeof(line), "RESET:%.1f deg", settings.resetAngle);
+    oledPrintRow(3, line);
+
+    snprintf(line, sizeof(line), "MODE:%s", settings.angleMode == AngleMode::ADAPTIVE ? "ADAPT" : "ABS");
+    oledPrintRow(4, line);
+
+    if (settings.angleMode == AngleMode::ADAPTIVE) {
+        snprintf(line, sizeof(line), "TAU:%.1fs", settings.adaptiveTimeConstantSec);
+        oledPrintRow(5, line);
+
+        snprintf(line, sizeof(line), "FREEZE:%.1f/s", settings.adaptiveFreezeRateDegSec);
+        oledPrintRow(6, line);
+    } else {
+        snprintf(line, sizeof(line), "HOLD:%lums", (unsigned long)settings.triggerHoldMs);
+        oledPrintRow(5, line);
+
+        snprintf(line, sizeof(line), "MIN:%lums", (unsigned long)settings.minimumOnTimeMs);
+        oledPrintRow(6, line);
+    }
+
+    oledPrintRow(7, "2x btn = mode");
+}
+
+void drawNetworkPage() {
+    char line[17];
+
+    oledPrintRow(0, "NETWORK      3/4");
+    oledPrintRow(1, "----------------");
+
+    if (!accessPointEnabled) {
+        oledPrintRow(2, "AP: OFF");
+        oledPrintRow(3, "WiFi disabled");
+        oledPrintRow(4, "");
+        oledPrintRow(5, "3x button");
+        oledPrintRow(6, "turns AP ON");
+        oledPrintRow(7, "");
+        return;
+    }
+
+    String ssidSuffix = wifiApSsid.substring(wifiApSsid.length() - 4);
+    snprintf(line, sizeof(line), "SSID: ...%s", ssidSuffix.c_str());
+    oledPrintRow(2, line);
+    oledPrintRow(3, "wheelie.local");
+    oledPrintRow(4, "192.168.4.1");
+
+    snprintf(line, sizeof(line), "CLIENTS:%u", WiFi.softAPgetStationNum());
+    oledPrintRow(5, line);
+
+    snprintf(line, sizeof(line), "mDNS:%s DNS:%s", mdnsHealthy ? "OK" : "--", dnsHealthy ? "OK" : "--");
+    oledPrintRow(6, line);
+    oledPrintRow(7, "3xAP 30sPwdRst");
+}
+
+void drawDiagnosticsPage() {
+    char line[17];
+
+    oledPrintRow(0, "DIAGNOSTICS  4/4");
+
+    snprintf(line, sizeof(line), "RAW:%+.1f", currentAbsolutePitch);
+    oledPrintRow(1, line);
+
+    snprintf(line, sizeof(line), "BASE:%+.1f", adaptiveBaseline);
+    oledPrintRow(2, line);
+
+    snprintf(line, sizeof(line), "TRIG:%+.1f", currentTriggerPitch);
+    oledPrintRow(3, line);
+
+    snprintf(line, sizeof(line), "GYRO:%+.1f/s", currentGyroRate);
+    oledPrintRow(4, line);
+
+    snprintf(line, sizeof(line), "+G:%.2fg", currentGLoad);
+    oledPrintRow(5, line);
+
+    snprintf(line, sizeof(line), "BASE:%s", adaptiveBaselineFrozen ? "FROZEN" : "TRACKING");
+    oledPrintRow(6, line);
+
+    snprintf(line, sizeof(line), "IMU:%s", imuHealthy ? "OK" : "FAULT");
+    oledPrintRow(7, line);
+}
+
+void drawWiFiPasswordResetScreen() {
+    oledPrintRow(0, " WIFI PASSWORD");
+    oledPrintRow(1, "----------------");
+    oledPrintRow(2, "RESET TO DEFAULT");
+    oledPrintRow(4, "wheeliectrl");
+    oledPrintRow(6, "AP is ON");
+    oledPrintRow(7, "Reconnect device");
+}
+
+void updateDisplay() {
+    unsigned long now = millis();
+
+    if (!displayDirty && (now - lastDisplayUpdate) < DISPLAY_REFRESH_MS) {
+        return;
+    }
+
+    lastDisplayUpdate = now;
+    displayDirty = false;
+
+    if ((long)(wifiPasswordResetNoticeUntil - now) > 0) {
+        drawWiFiPasswordResetScreen();
+        return;
+    }
+
+    if (operatingMode == OperatingMode::STANDBY) {
+        drawStandbyScreen();
+        return;
+    }
+
+    switch (displayPage) {
+        case DisplayPage::STATUS: drawStatusPage(); break;
+        case DisplayPage::SETTINGS: drawSettingsPage(); break;
+        case DisplayPage::NETWORK: drawNetworkPage(); break;
+        case DisplayPage::DIAGNOSTICS: drawDiagnosticsPage(); break;
+    }
+}
+
+// =====================================================
+// VIBRATION-TOLERANT CALIBRATION
+// =====================================================
+
+bool calibrateMPU() {
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("IMU CALIBRATION");
+    Serial.println("Bike must remain stationary.");
+    Serial.println("Normal engine-idle vibration is OK.");
+    Serial.println("======================================");
+
+    forceOutputOff();
+    drawCalibrationScreen();
+
+    unsigned long started = millis();
+    int accepted = 0;
+    int rejected = 0;
+
+    double sumAx = 0.0;
+    double sumAy = 0.0;
+    double sumAz = 0.0;
+    double sumGy = 0.0;
+
+    double sumAccelMag = 0.0;
+    double sumAccelSq = 0.0;
+    double sumGySq = 0.0;
+
+    MPUData data;
+
+    while (
+        accepted < CALIBRATION_ACCEPTED_SAMPLES &&
+        (millis() - started) < CALIBRATION_TIMEOUT_MS
+    ) {
+        if (!readMPU(data)) {
+            rejected++;
+            delay(2);
+            continue;
+        }
+
+        float accelMag = sqrtf(
+            data.ax * data.ax +
+            data.ay * data.ay +
+            data.az * data.az
+        );
+        float selectedGyroRate = getSelectedGyroRate(data);
+
+        bool usable =
+            accelMag >= CAL_ACCEL_MAG_MIN_G &&
+            accelMag <= CAL_ACCEL_MAG_MAX_G &&
+            fabsf(selectedGyroRate) <= CAL_MAX_GYRO_AXIS_DPS;
+
+        if (!usable) {
+            rejected++;
+            delay(2);
+            continue;
+        }
+
+        sumAx += data.ax;
+        sumAy += data.ay;
+        sumAz += data.az;
+        sumGy += selectedGyroRate;
+
+        // Track magnitude statistics separately from scale error. A clone
+        // that reads 1.12 g at rest should not be mistaken for vibration.
+        sumAccelMag += accelMag;
+        sumAccelSq += accelMag * accelMag;
+        sumGySq += selectedGyroRate * selectedGyroRate;
+
+        accepted++;
+
+        if ((accepted % 250) == 0) {
+            char line[17];
+            snprintf(line, sizeof(line), "%d / %d", accepted, CALIBRATION_ACCEPTED_SAMPLES);
+            oledPrintRow(6, line);
+        }
+
+        delay(2);
+    }
+
+    if (accepted < CALIBRATION_ACCEPTED_SAMPLES) {
+        Serial.printf("Calibration FAILED: accepted=%d rejected=%d\n", accepted, rejected);
+        imuHealthy = false;
+        drawCalibrationScreen("CAL FAILED");
+        delay(1200);
+        displayDirty = true;
+        return false;
+    }
+
+    float avgAx = (float)(sumAx / accepted);
+    float avgAy = (float)(sumAy / accepted);
+    float avgAz = (float)(sumAz / accepted);
+
+    gyroAxisBias = (float)(sumGy / accepted);
+    pitchZero = calculateAccelPitchFromVector(avgAx, avgAy, avgAz);
+    pitch = pitchZero;
+
+    calibrationRestMagnitudeRaw = (float)(sumAccelMag / accepted);
+    if (calibrationRestMagnitudeRaw > 0.5f && calibrationRestMagnitudeRaw < 1.5f) {
+        accelScaleCorrection = 1.0f / calibrationRestMagnitudeRaw;
+    } else {
+        accelScaleCorrection = 1.0f;
+    }
+
+    float accelMeanSquare = (float)(sumAccelSq / accepted);
+    float accelVariance = accelMeanSquare -
+        (calibrationRestMagnitudeRaw * calibrationRestMagnitudeRaw);
+    if (accelVariance < 0.0f) accelVariance = 0.0f;
+    calibrationAccelNoiseRms = sqrtf(accelVariance);
+
+    // Initialize the gravity estimator from the calibrated resting vector,
+    // normalized so stationary acceleration is exactly one gravity vector.
+    gravityEstimateX = avgAx * accelScaleCorrection;
+    gravityEstimateY = avgAy * accelScaleCorrection;
+    gravityEstimateZ = avgAz * accelScaleCorrection;
+    currentAccelX = gravityEstimateX;
+    currentAccelY = gravityEstimateY;
+    currentAccelZ = gravityEstimateZ;
+    currentGLoad = 0.0f;
+    highestAngle = 0.0f;
+    highestGLoad = 0.0f;
+
+    // Gyro vibration/noise is the RMS variation around the measured bias,
+    // not the bias itself.
+    float gyroMeanSquare = (float)(sumGySq / accepted);
+    float gyroVariance = gyroMeanSquare - (gyroAxisBias * gyroAxisBias);
+    if (gyroVariance < 0.0f) gyroVariance = 0.0f;
+    calibrationGyroNoiseRms = sqrtf(gyroVariance);
+
+    calibrationHighVibration =
+        calibrationAccelNoiseRms > 0.08f ||
+        calibrationGyroNoiseRms > 4.0f;
+
+    currentAbsolutePitch = 0.0f;
+    adaptiveBaseline = 0.0f;
+    currentTriggerPitch = 0.0f;
+    currentGyroRate = 0.0f;
+    adaptiveBaselineFrozen = false;
+
+    imuHealthy = true;
+    imuFailureCount = 0;
+    imuRecoveryCount = IMU_RECOVERY_LIMIT;
+
+    Serial.printf("Calibration complete. Accepted=%d Rejected=%d\n", accepted, rejected);
+    Serial.printf("Gyro %s bias: %.3f deg/s\n", getRotationAxisName(), gyroAxisBias);
+    Serial.printf("Physical zero: %.2f deg\n", pitchZero);
+    Serial.printf("Resting accel magnitude: %.4f raw g (scale x%.4f)\n", calibrationRestMagnitudeRaw, accelScaleCorrection);
+    Serial.printf("Accel vibration RMS: %.4f g\n", calibrationAccelNoiseRms);
+    Serial.printf("Gyro vibration RMS: %.3f deg/s\n", calibrationGyroNoiseRms);
+
+    if (calibrationHighVibration) {
+        Serial.println("WARNING: calibration vibration level was high");
+    }
+
+    flashCalibrationComplete();
+    oled.clearDisplay();
+    displayDirty = true;
+    return true;
+}
+
+// =====================================================
+// ANGLE PROCESSING - v0.9
+// =====================================================
+
+void resetAdaptiveBaselineToCurrent() {
+    if (settings.angleMode == AngleMode::ADAPTIVE) {
+        adaptiveBaseline = currentAbsolutePitch;
+        currentTriggerPitch = 0.0f;
+    } else {
+        adaptiveBaseline = 0.0f;
+        currentTriggerPitch = currentAbsolutePitch;
+    }
+
+    adaptiveBaselineFrozen = false;
+}
+
+void updateAngleProcessing(float dt) {
+    // Adaptive mode follows terrain only during ordinary, stable riding.
+    // The portable helper is also exercised by the desktop test suite.
+    const bool controllerAllowsTracking =
+        operatingMode == OperatingMode::ARMED &&
+        controllerState == ControllerState::NORMAL;
+    currentTriggerPitch = processTriggerPitch(
+        currentAbsolutePitch, currentGyroRate, dt, imuHealthy,
+        controllerAllowsTracking, settings, adaptiveBaseline,
+        adaptiveBaselineFrozen);
+    if (currentTriggerPitch > highestAngle) highestAngle = currentTriggerPitch;
+}
+
+// =====================================================
+// OPERATING MODE
+// =====================================================
+
+void setOperatingMode(OperatingMode mode) {
+    operatingMode = mode;
+    controllerState = ControllerState::NORMAL;
+    triggerStartTime = 0;
+    wheelieStartTime = 0;
+    manualTestActive = false;
+    forceOutputOff();
+
+    if (mode == OperatingMode::ARMED) {
+        // In adaptive mode, arming establishes the current road attitude
+        // as the initial adaptive reference.
+        resetAdaptiveBaselineToCurrent();
+    }
+
+    oled.clearDisplay();
+    displayDirty = true;
+}
+
+void toggleOperatingMode() {
+    if (operatingMode == OperatingMode::ARMED) {
+        setOperatingMode(OperatingMode::STANDBY);
+        Serial.println("MODE -> STANDBY");
+    } else {
+        setOperatingMode(OperatingMode::ARMED);
+        Serial.println("MODE -> ARMED");
+    }
+}
+
+// =====================================================
+// BUTTON
+// =====================================================
+
+void cycleDisplayPage() {
+    if (operatingMode != OperatingMode::ARMED) {
+        return;
+    }
+
+    switch (displayPage) {
+        case DisplayPage::STATUS: displayPage = DisplayPage::SETTINGS; break;
+        case DisplayPage::SETTINGS: displayPage = DisplayPage::NETWORK; break;
+        case DisplayPage::NETWORK: displayPage = DisplayPage::DIAGNOSTICS; break;
+        case DisplayPage::DIAGNOSTICS: displayPage = DisplayPage::STATUS; break;
+    }
+
+    oled.clearDisplay();
+    displayDirty = true;
+}
+
+void toggleAngleModeFromButton() {
+    // Stop any active/pending wheelie output before changing the
+    // interpretation of pitch. This prevents a mode switch from
+    // accidentally carrying an old trigger state into the new mode.
+    controllerState = ControllerState::NORMAL;
+    triggerStartTime = 0;
+    wheelieStartTime = 0;
+    forceOutputOff();
+
+    if (settings.angleMode == AngleMode::ABSOLUTE) {
+        settings.angleMode = AngleMode::ADAPTIVE;
+
+        // Make the current road/bike attitude the starting adaptive
+        // reference so switching modes does not create a pitch jump.
+        adaptiveBaseline = currentAbsolutePitch;
+        currentTriggerPitch = 0.0f;
+        adaptiveBaselineFrozen = false;
+    } else {
+        settings.angleMode = AngleMode::ABSOLUTE;
+        adaptiveBaseline = 0.0f;
+        currentTriggerPitch = currentAbsolutePitch;
+        adaptiveBaselineFrozen = false;
+    }
+
+    // Button-selected angle mode is persistent, just like a web change.
+    saveSettings();
+
+    Serial.print("ANGLE MODE -> ");
+    Serial.println(getAngleModeName());
+
+    oled.clearDisplay();
+    displayDirty = true;
+}
+
+void registerShortTap(unsigned long now) {
+    // Add this release to the current multi-tap gesture. A triple tap
+    // can be executed immediately because there is no four-tap action.
+    shortTapCount++;
+    lastTapReleaseTime = now;
+
+    if (shortTapCount >= 3) {
+        shortTapCount = 0;
+        toggleAccessPointFromButton();
+    }
+}
+
+void resolveShortTapGesture() {
+    if (shortTapCount == 0) {
+        return;
+    }
+
+    if (debouncedButtonState == LOW) {
+        return;
+    }
+
+    if ((millis() - lastTapReleaseTime) <= BUTTON_MULTI_TAP_MS) {
+        return;
+    }
+
+    uint8_t taps = shortTapCount;
+    shortTapCount = 0;
+
+    if (taps == 1) {
+        cycleDisplayPage();
+    } else if (taps == 2) {
+        toggleAngleModeFromButton();
+    }
+}
+
+void resetWiFiPasswordToDefault() {
+    wifiApPassword = DEFAULT_WIFI_AP_PASSWORD;
+    saveSettings();
+
+    // A 30-second physical hold is the recovery path, so make sure the AP
+    // is actually available with the default credential afterward.
+    if (accessPointEnabled) {
+        scheduleAccessPointRestart(250);
+    } else {
+        startAccessPoint();
+    }
+
+    wifiPasswordResetNoticeUntil = millis() + 4000;
+    oled.clearDisplay();
+    displayDirty = true;
+
+    Serial.println("Wi-Fi password reset to default: wheeliectrl");
+}
+
+void updateButton() {
+    unsigned long now = millis();
+    bool rawState = digitalRead(USER_BUTTON_PIN);
+
+    if (rawState != lastRawButtonState) {
+        lastButtonChangeTime = now;
+        lastRawButtonState = rawState;
+    }
+
+    if ((now - lastButtonChangeTime) >= BUTTON_DEBOUNCE_MS) {
+        if (rawState != debouncedButtonState) {
+            debouncedButtonState = rawState;
+
+            if (debouncedButtonState == LOW) {
+                buttonPressStartTime = now;
+                longPressHandled = false;
+                longPressGestureActive = false;
+            } else {
+                unsigned long heldMs = now - buttonPressStartTime;
+
+                if (!longPressHandled) {
+                    if (heldMs >= BUTTON_LONG_PRESS_MS) {
+                        // ARM/STANDBY occurs on release. This lets a 30 s
+                        // password-reset hold coexist with the normal hold.
+                        shortTapCount = 0;
+                        toggleOperatingMode();
+                    } else {
+                        registerShortTap(now);
+                    }
+                }
+
+                longPressGestureActive = false;
+            }
+        }
+    }
+
+    if (debouncedButtonState == LOW && !longPressHandled) {
+        unsigned long heldMs = now - buttonPressStartTime;
+
+        if (heldMs >= BUTTON_LONG_PRESS_MS) {
+            // Once it is clearly a hold, discard any partial tap gesture.
+            shortTapCount = 0;
+            longPressGestureActive = true;
+        }
+
+        if (heldMs >= BUTTON_WIFI_PASSWORD_RESET_MS) {
+            shortTapCount = 0;
+            resetWiFiPasswordToDefault();
+            longPressHandled = true;
+            longPressGestureActive = false;
+        }
+    }
+
+    resolveShortTapGesture();
+}
+
+// =====================================================
+// WHEELIE STATE MACHINE
+// =====================================================
+
+uint8_t patternBrightness(LightPattern pattern, uint8_t brightness, unsigned long now) {
+    return calculatePatternBrightness(pattern, brightness, now);
+}
+
+void updateHighAngleWarning(float triggerPitch) {
+    highAngleWarningActive = stepHighAngleWarning(
+        highAngleWarningActive, triggerPitch, currentGyroRate, settings);
+}
+
+void updateController(float triggerPitch) {
+    if (operatingMode != OperatingMode::ARMED) {
+        controllerState = ControllerState::NORMAL;
+        highAngleWarningActive = false;
+
+        if (!manualTestActive) {
+            setOutputTarget(0);
+        }
+        return;
+    }
+
+    if (!imuHealthy) {
+        controllerState = ControllerState::NORMAL;
+        highAngleWarningActive = false;
+        forceOutputOff();
+        return;
+    }
+
+    ControllerState previousState = controllerState;
+    bool outputOn = stepController(
+        controllerState, triggerPitch, millis(), settings,
+        triggerStartTime, wheelieStartTime
+    );
+    updateHighAngleWarning(triggerPitch);
+
+    if (previousState != ControllerState::WHEELIE && controllerState == ControllerState::WHEELIE) {
+        activeWheeliePeakAngle = triggerPitch;
+        activeWheeliePeakG = currentGLoad;
+    }
+    if (controllerState == ControllerState::WHEELIE) {
+        activeWheeliePeakAngle = max(activeWheeliePeakAngle, triggerPitch);
+        activeWheeliePeakG = max(activeWheeliePeakG, currentGLoad);
+    }
+    if (previousState == ControllerState::WHEELIE && controllerState != ControllerState::WHEELIE) {
+        completedWheelieCount++;
+        lastWheelieDurationMs = millis() - wheelieStartTime;
+        lastWheeliePeakAngle = activeWheeliePeakAngle;
+        lastWheeliePeakG = activeWheeliePeakG;
+    }
+
+    uint8_t requestedBrightness = 0;
+    if (highAngleWarningActive) {
+        requestedBrightness = patternBrightness(
+            settings.warningPattern, settings.warningBrightness, millis());
+    } else if (outputOn) {
+        requestedBrightness = patternBrightness(
+            settings.wheeliePattern, settings.brightness, millis());
+    }
+    setOutputTarget(requestedBrightness, true);
+    if (controllerState != previousState) displayDirty = true;
+}
+
+// =====================================================
+// WRITE-TOKEN / WEB SECURITY HELPER
+// =====================================================
+
+String makeWriteToken() {
+    char buffer[17];
+    uint32_t a = esp_random();
+    uint32_t b = esp_random();
+    snprintf(buffer, sizeof(buffer), "%08lX%08lX", (unsigned long)a, (unsigned long)b);
+    return String(buffer);
+}
+
+bool validWriteToken() {
+    return server.hasArg("token") && server.arg("token") == writeToken;
+}
+
+bool requireWriteToken() {
+    if (!validWriteToken()) {
+        server.send(403, "text/plain", "Invalid write token");
+        return false;
+    }
+    return true;
+}
+
+// =====================================================
+// WEB DASHBOARD
+// =====================================================
+
+const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Wheelie Controller</title>
+<style>
+:root{color-scheme:dark;--bg:#070a0f;--panel:#101722;--panel2:#151e2b;--line:#263449;--text:#f6f8fc;--muted:#8b98aa;--blue:#4ca6ff;--violet:#8967ff;--cyan:#55e6ff;--green:#57e39a;--yellow:#ffd166;--red:#ff667a}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 18% -10%,rgba(76,166,255,.22),transparent 34%),radial-gradient(circle at 90% 0,rgba(137,103,255,.16),transparent 30%),linear-gradient(180deg,#080c13,#06080c);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{width:min(1080px,100%);margin:auto;padding:16px}.top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:4px 0 14px}.brand h1{font-size:clamp(22px,5vw,34px);margin:0;letter-spacing:-.04em}.brand p{margin:4px 0 0;color:var(--muted);font-size:13px}.topActions{display:flex;align-items:center;gap:8px}.iconBtn,.badge{height:42px;border:1px solid var(--line);background:rgba(16,23,34,.86);border-radius:13px;color:var(--text);display:flex;align-items:center;justify-content:center;text-decoration:none}.iconBtn{width:42px}.iconBtn svg{width:21px;height:21px}.badge{padding:0 12px;gap:7px;font-size:12px;font-weight:750}.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:13px}.card{grid-column:span 12;background:linear-gradient(180deg,rgba(19,28,41,.96),rgba(13,19,28,.96));border:1px solid var(--line);border-radius:19px;padding:16px;box-shadow:0 20px 60px rgba(0,0,0,.22)}@media(min-width:760px){.attitude{grid-column:span 8}.side{grid-column:span 4}.half{grid-column:span 6}}.eyebrow{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.15em}.attitudeTop{display:flex;justify-content:space-between;gap:12px;align-items:end}.bigPitch{font-size:clamp(52px,11vw,88px);font-weight:850;line-height:.9;letter-spacing:-.075em}.pitchLabel{color:var(--muted);font-size:12px;margin-top:7px}.bikeStage{height:250px;margin:14px 0 10px;border-radius:17px;position:relative;overflow:hidden;background:radial-gradient(circle at 50% 30%,rgba(85,230,255,.10),transparent 35%),linear-gradient(180deg,#0b1320 0%,#0a1018 58%,#070a0f 100%);border:1px solid #26364a;perspective:700px}.horizon{position:absolute;left:-15%;right:-15%;bottom:36%;height:2px;background:linear-gradient(90deg,transparent,rgba(76,166,255,.6),rgba(137,103,255,.6),transparent);box-shadow:0 0 18px rgba(76,166,255,.32)}.road{position:absolute;width:150%;height:45%;left:-25%;bottom:-24%;background:linear-gradient(180deg,#101824,#070a0f);border-top:1px solid #2a3b51;transform:perspective(300px) rotateX(55deg)}.road:after{content:"";position:absolute;left:50%;top:0;width:3px;height:100%;background:repeating-linear-gradient(180deg,rgba(255,255,255,.65) 0 14px,transparent 14px 30px);transform:translateX(-50%)}.bikeWrap{position:absolute;left:50%;top:51%;width:min(480px,82%);transform:translate(-50%,-50%);transform-origin:50% 72%;transition:transform .12s linear;filter:drop-shadow(0 18px 14px rgba(0,0,0,.42))}.bikeSvg{width:100%;overflow:visible}.wheel{fill:#080a0e;stroke:#a6b7ca;stroke-width:7}.rim{fill:none;stroke:#394b60;stroke-width:3}.frame{fill:none;stroke:url(#frameGrad);stroke-width:8;stroke-linecap:round;stroke-linejoin:round}.metal{fill:none;stroke:#aab7c8;stroke-width:5;stroke-linecap:round}.bodyFill{fill:url(#bodyGrad);stroke:#7ac6ff;stroke-width:2}.bikeGlow{filter:drop-shadow(0 0 8px rgba(76,166,255,.28))}.telemetry{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.mini{background:#0a1018;border:1px solid var(--line);border-radius:12px;padding:10px}.mini span{display:block;color:var(--muted);font-size:11px;margin-bottom:4px}.mini strong{font-size:16px}.side h2,.half h2{font-size:15px;margin:0 0 12px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}.stat{background:#0a1018;border:1px solid var(--line);border-radius:13px;padding:11px}.stat span{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.stat strong{font-size:15px}.peakGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.peak{position:relative;background:linear-gradient(180deg,#101a27,#0a1018);border:1px solid var(--line);border-radius:13px;padding:11px 36px 11px 11px}.peak span{display:block;color:var(--muted);font-size:11px;margin-bottom:5px}.peak strong{font-size:18px}.peakReset{position:absolute;right:8px;top:50%;transform:translateY(-50%);width:26px;height:26px;border-radius:8px;border:1px solid var(--line);background:#172131;color:var(--muted);font-size:16px;line-height:1;cursor:pointer}.peakReset:active{transform:translateY(-50%) scale(.95)}.meter{margin-top:13px}.meterHead{display:flex;justify-content:space-between;gap:8px;font-size:12px}.meterHead span{color:var(--muted)}.bar{height:10px;border-radius:999px;background:#080c12;border:1px solid var(--line);overflow:hidden;margin-top:7px;position:relative}.barFill{height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .12s linear}.centerBar:after{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:#8190a4}.gyroFill{position:absolute;top:0;height:100%;left:50%;width:0;background:linear-gradient(90deg,var(--violet),var(--cyan));transition:left .12s linear,width .12s linear}.angleFlow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:7px;align-items:center;text-align:center;margin-top:12px}.angleBox{padding:10px 5px;border-radius:11px;background:#0a1018;border:1px solid var(--line)}.angleBox small{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.arrow{color:var(--muted)}.statusGood{color:var(--green)}.statusBad{color:var(--red)}.statusWarn{color:var(--yellow)}.foot{color:var(--muted);font-size:11px;text-align:center;margin:14px 0 3px}@media(max-width:520px){.badge{display:none}.bikeStage{height:215px}.telemetry{grid-template-columns:1fr 1fr}.telemetry .mini:last-child{grid-column:1/-1}.angleFlow{gap:4px}.angleBox strong{font-size:13px}}
+body[data-theme="light"]{color-scheme:light;--bg:#eef3f9;--panel:#fff;--panel2:#f5f8fc;--line:#cbd7e6;--text:#152033;--muted:#607087;background:radial-gradient(circle at 18% -10%,rgba(76,166,255,.18),transparent 34%),radial-gradient(circle at 90% 0,rgba(137,103,255,.12),transparent 30%),linear-gradient(180deg,#f8fbff,#eaf0f7)}
+body[data-theme="light"] .card{background:linear-gradient(180deg,rgba(255,255,255,.98),rgba(245,248,252,.98));box-shadow:0 18px 50px rgba(45,67,94,.12)}body[data-theme="light"] .iconBtn,body[data-theme="light"] .badge{background:rgba(255,255,255,.9)}body[data-theme="light"] .mini,body[data-theme="light"] .stat,body[data-theme="light"] .angleBox{background:#f7faff}body[data-theme="light"] .peak{background:linear-gradient(180deg,#f7faff,#eef4fa)}body[data-theme="light"] .bar{background:#e2eaf4}body[data-theme="light"] .bikeStage{background:radial-gradient(circle at 50% 30%,rgba(85,230,255,.16),transparent 38%),linear-gradient(180deg,#eaf5ff 0%,#dce8f4 58%,#cdd9e6 100%)}
+html,body{max-width:100%;overflow-x:hidden}.grid>*{min-width:0}.modeControl{position:relative;overflow:hidden;width:100%;font:inherit;color:var(--text);text-align:left;cursor:pointer;transition:border-color .18s,transform .12s,box-shadow .18s}.modeControl:after{content:"";position:absolute;left:0;bottom:0;width:var(--hold-progress,0%);height:3px;background:linear-gradient(90deg,var(--blue),var(--cyan));box-shadow:0 0 10px var(--blue);transition:width .08s linear}.modeControl.holding{border-color:var(--blue);box-shadow:0 0 0 3px rgba(76,166,255,.1)}.modeControl:hover{border-color:var(--blue);box-shadow:0 0 0 3px rgba(76,166,255,.1)}.modeControl:active{transform:scale(.98)}.modeControl[disabled]{cursor:wait;opacity:.65}.modeHint{font-size:9px!important;text-transform:uppercase;letter-spacing:.08em;margin-top:5px!important}.colorControl{position:relative;width:42px;height:42px;overflow:hidden}.colorControl input{position:absolute;inset:-8px;width:58px;height:58px;border:0;padding:0;cursor:pointer}.colorControl:after{content:"";position:absolute;inset:8px;border:2px solid rgba(255,255,255,.8);border-radius:50%;pointer-events:none}.bikeStage:after{content:"LIVE ATTITUDE";position:absolute;right:12px;bottom:10px;color:var(--muted);font-size:9px;letter-spacing:.16em}.bikeWrap{will-change:transform}.wheel{filter:drop-shadow(0 2px 2px rgba(0,0,0,.4))}
+@media(max-width:900px){.wrap{padding:10px}.attitude,.side,.half{grid-column:1/-1!important}.bikeStage{height:clamp(190px,54vw,250px)}.card{padding:13px;border-radius:16px}.grid{gap:10px}.top{align-items:flex-start}.brand p{max-width:230px}.bigPitch{font-size:clamp(48px,15vw,72px)}}
+@media(max-width:390px){.brand p{display:none}.topActions{gap:5px}.iconBtn,.colorControl{width:38px;height:38px}.stats,.peakGrid{grid-template-columns:1fr 1fr}.angleFlow{grid-template-columns:1fr auto 1fr auto 1fr}.card{padding:11px}.bikeStage{margin-top:10px}.foot{padding:0 8px}}
+.instrumentCard{background:linear-gradient(180deg,rgba(16,23,34,.98),rgba(9,14,21,.98))}.stateBlock{text-align:right;padding:9px 12px;border:1px solid var(--line);border-radius:11px;background:rgba(8,13,20,.62)}.stateBlock strong{display:block;margin-top:4px;font-size:16px;letter-spacing:.04em}.instrumentCard .bikeStage{height:230px;background:linear-gradient(180deg,rgba(9,16,25,.98),rgba(7,11,17,.98));border-color:#243247;box-shadow:inset 0 0 45px rgba(0,0,0,.26)}.instrumentCard .bikeStage:after{content:none}.instrumentGrid{position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent 0 35px,rgba(130,153,180,.055) 35px 36px),linear-gradient(90deg,transparent 49.85%,rgba(130,153,180,.12) 50%,transparent 50.15%)}.horizon{bottom:34%;height:1px;background:linear-gradient(90deg,transparent 4%,rgba(76,166,255,.72) 20%,rgba(76,166,255,.72) 80%,transparent 96%);box-shadow:0 0 12px rgba(76,166,255,.2)}.horizon span{position:absolute;right:10px;top:-15px;font-size:8px;letter-spacing:.14em;color:var(--muted)}.pitchScale{position:absolute;z-index:2;left:8px;top:12px;bottom:12px;width:48px;overflow:hidden;color:var(--muted);font:9px ui-monospace,SFMono-Regular,Consolas,monospace;mask-image:linear-gradient(transparent,#000 14%,#000 86%,transparent)}.pitchScale:after{content:"";position:absolute;left:0;top:50%;width:36px;border-top:1px solid var(--cyan);box-shadow:0 0 7px rgba(85,230,255,.45)}.pitchTape{position:absolute;left:0;top:50%;width:100%;height:0;transform:translateY(0);transition:transform .12s linear;will-change:transform}.pitchTick{position:absolute;left:0;top:calc(var(--tick) * -3px);width:100%;transform:translateY(-50%);white-space:nowrap}.pitchTick:after{content:"";display:inline-block;width:12px;margin-left:6px;border-top:1px solid rgba(139,152,170,.42);vertical-align:middle}.pitchTick.major{color:var(--text);font-weight:700}.instrumentCard .bikeWrap{top:49%;width:min(440px,76%);filter:drop-shadow(0 15px 10px rgba(0,0,0,.34))}.instrumentCard .telemetry{grid-template-columns:1fr 1fr}.instrumentCard .mini{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:11px 13px}.instrumentCard .mini span{margin:0}.instrumentCard .mini strong{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:15px}.instrumentCard .bigPitch{font-variant-numeric:tabular-nums}.instrumentCard .eyebrow{letter-spacing:.12em}
+body[data-theme="light"] .instrumentCard{background:linear-gradient(180deg,#fff,#f3f7fb)}body[data-theme="light"] .instrumentCard .bikeStage{background:linear-gradient(180deg,#edf4fa,#dce6ef)}body[data-theme="light"] .stateBlock{background:#f6f9fc}
+.modeControl{touch-action:manipulation;user-select:none;-webkit-user-select:none}
+.pitchScale{-webkit-mask-image:linear-gradient(transparent,#000 14%,#000 86%,transparent)}
+.instrumentGrid,.horizon{transition:opacity .2s ease}.tapeEnabled .instrumentGrid,.tapeEnabled .horizon{opacity:0}.tapeDisabled .pitchScale{display:none}.instrumentReadouts{position:absolute;z-index:4;right:10px;top:10px;bottom:10px;width:clamp(96px,24%,132px);display:flex;flex-direction:column;justify-content:space-between;pointer-events:none}.instrumentReadout{min-height:72px;padding:10px 11px;border:1px solid var(--line);border-radius:11px;background:rgba(8,13,20,.82);box-shadow:0 8px 24px rgba(0,0,0,.18);backdrop-filter:blur(5px)}.instrumentReadout .bigPitch{margin-top:4px;font-size:clamp(27px,5vw,39px);line-height:.95;letter-spacing:-.055em}.instrumentReadout strong{display:block;margin-top:7px;font-size:16px;letter-spacing:.035em}.instrumentReadout .pitchLabel{margin-top:5px;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.instrumentCard .bikeWrap{left:43%;width:min(390px,64%)}body[data-theme="light"] .instrumentReadout{background:rgba(247,250,253,.88)}
+@media(max-width:420px){.instrumentReadouts{right:7px;top:7px;bottom:7px;width:96px}.instrumentReadout{min-height:66px;padding:8px}.instrumentReadout .bigPitch{font-size:27px}.instrumentCard .bikeWrap{left:41%;width:62%}}
+@keyframes stageAlertFlash{0%,42%{opacity:.62}50%,92%{opacity:.08}100%{opacity:.62}}.bikeStage:before{content:"";position:absolute;z-index:1;inset:0;background:var(--stage-effect-color,transparent);opacity:0;pointer-events:none;transition:opacity .18s ease}.bikeStage.effectSolid:before{opacity:.52}.bikeStage.effectFlash:before{animation:stageAlertFlash .75s steps(1,end) infinite}.bikeStage.effectSolid,.bikeStage.effectFlash{border-color:var(--stage-effect-color);box-shadow:inset 0 0 45px rgba(0,0,0,.2),0 0 18px color-mix(in srgb,var(--stage-effect-color),transparent 55%)}
+.bikeWrap{z-index:2}
+.instrumentCard .telemetry{grid-template-columns:repeat(2,minmax(0,1fr))}.instrumentCard .telemetry .mini:last-child{grid-column:auto}.instrumentCard .telemetry .mini span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.instrumentCard .telemetry .mini strong{flex:0 0 auto}
+@media(max-width:380px){.instrumentCard .telemetry{grid-template-columns:1fr}.instrumentCard .telemetry .mini:last-child{grid-column:auto}}
+.rideExit{display:none;position:absolute;z-index:8;right:10px;top:50%;transform:translateY(-50%);width:34px;height:34px;padding:0;border:1px solid var(--line);border-radius:10px;background:rgba(8,13,20,.78);color:var(--text);font-size:19px}.rideGraph{width:100%;height:122px;margin-top:12px;border:1px solid var(--line);border-radius:12px;background:#080d14}.eventStats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px}.eventStat{padding:9px;border:1px solid var(--line);border-radius:11px;background:#0a1018}.eventStat span{display:block;color:var(--muted);font-size:10px}.eventStat strong{display:block;margin-top:4px;font-size:14px}.rideMode .top,.rideMode .side,.rideMode .telemetry,.rideMode .foot{display:none}.rideMode .wrap{width:100%;max-width:none;padding:0}.rideMode .grid{display:block}.rideMode .instrumentCard{min-height:100vh;border:0;border-radius:0;padding:8px}.rideMode .bikeStage{height:calc(100vh - 16px);margin:0;border-radius:14px}.rideMode .rideExit{display:block}
+.pitchScale{left:calc(8px + env(safe-area-inset-left,0px));top:calc(12px + env(safe-area-inset-top,0px));bottom:calc(12px + env(safe-area-inset-bottom,0px))}
+.viewSwitch{display:grid;grid-template-columns:1fr 1fr;gap:4px;width:min(390px,100%);margin:0 auto 13px;padding:4px;border:1px solid var(--line);border-radius:14px;background:rgba(10,16,24,.78)}.viewBtn{border:0;border-radius:10px;padding:9px 12px;background:transparent;color:var(--muted);font:inherit;font-size:12px;font-weight:750;cursor:pointer}.viewBtn.active{background:var(--panel2);color:var(--text);box-shadow:0 4px 14px rgba(0,0,0,.2)}.dashboardCard{display:none;grid-column:1/-1}.dashboardCard.activeView{display:block}.fullExit{display:none;position:absolute;z-index:8;right:calc(10px + env(safe-area-inset-right,0px));top:calc(10px + env(safe-area-inset-top,0px));width:38px;height:38px;padding:0;border:1px solid var(--line);border-radius:10px;background:rgba(8,13,20,.82);color:var(--text);font-size:21px}.side{position:relative}
+.fullscreenView .top,.fullscreenView .viewSwitch,.fullscreenView .foot{display:none}.fullscreenView .wrap{width:100%;max-width:none;padding:0}.fullscreenView .grid{display:block}.fullscreenView .dashboardCard{display:none}.fullscreenView .dashboardCard.fullscreenActive{display:block;min-height:100svh;border:0;border-radius:0;padding:calc(8px + env(safe-area-inset-top,0px)) calc(8px + env(safe-area-inset-right,0px)) calc(8px + env(safe-area-inset-bottom,0px)) calc(8px + env(safe-area-inset-left,0px))}.fullscreenView .fullscreenActive .fullExit{display:block}.fullscreenView .instrumentCard .telemetry{display:none}.fullscreenView .instrumentCard .bikeStage{height:calc(100svh - 16px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));margin:0;border-radius:14px}.fullscreenView .side{overflow:auto}.fullscreenView .side h2{padding-right:52px}.fullscreenView .side .rideGraph{height:clamp(160px,28svh,280px)}
+.fullscreenView .instrumentCard.fullscreenActive{padding:8px}.fullscreenView .instrumentCard .bikeStage{height:calc(100svh - 16px)}
+body[data-theme="light"] .viewSwitch{background:rgba(255,255,255,.8)}body[data-theme="light"] .viewBtn.active{background:#fff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand"><h1>Wheelie Controller</h1><p>Live motorcycle attitude & lighting telemetry</p></div>
+    <div class="topActions">
+      <div class="badge"><span class="dot" id="connDot"></span><span id="connText">Connected</span></div>
+      <button class="iconBtn" id="themeBtn" type="button" aria-label="Toggle day and night mode" title="Day / night mode">
+        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/></svg>
+      </button>
+      <button class="iconBtn" id="rideBtn" type="button" aria-label="Open full-screen riding view" title="Riding view">⛶</button>
+      <a class="iconBtn" href="/settings" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5 5L3 18l3 3 6.7-6.7a4 4 0 0 0 5-5l-2.5 2.5-3-3 2.5-2.5Z"/></svg>
+      </a>
+    </div>
+  </header>
+
+  <nav class="viewSwitch" aria-label="Dashboard view">
+    <button class="viewBtn active" id="controllerViewBtn" type="button">Wheelie controller</button>
+    <button class="viewBtn" id="telemetryViewBtn" type="button">Live telemetry</button>
+  </nav>
+
+  <main class="grid">
+    <section class="card attitude instrumentCard dashboardCard activeView" id="controllerCard">
+      <div class="bikeStage" id="bikeStage">
+        <button class="fullExit" id="controllerExit" type="button" aria-label="Exit full screen">×</button>
+        <div class="instrumentGrid"></div><div class="horizon"><span>LEVEL</span></div>
+        <div class="pitchScale" aria-hidden="true"><div class="pitchTape" id="pitchTape"><span class="pitchTick major" style="--tick:60">60°</span><span class="pitchTick" style="--tick:50">50°</span><span class="pitchTick major" style="--tick:40">40°</span><span class="pitchTick" style="--tick:30">30°</span><span class="pitchTick major" style="--tick:20">20°</span><span class="pitchTick" style="--tick:10">10°</span><span class="pitchTick major" style="--tick:0">0°</span><span class="pitchTick" style="--tick:-10">−10°</span><span class="pitchTick major" style="--tick:-20">−20°</span><span class="pitchTick" style="--tick:-30">−30°</span><span class="pitchTick major" style="--tick:-40">−40°</span><span class="pitchTick" style="--tick:-50">−50°</span><span class="pitchTick major" style="--tick:-60">−60°</span></div></div>
+        <div class="instrumentReadouts">
+          <div class="instrumentReadout"><div class="eyebrow">Wheelie pitch</div><div class="bigPitch" id="pitch">0.0°</div><div class="pitchLabel" id="angleModeLine">ABSOLUTE mode</div></div>
+          <div class="instrumentReadout"><div class="eyebrow">Detection</div><strong id="state">NORMAL</strong><div class="pitchLabel">Current state</div></div>
+        </div>
+        <div class="bikeWrap" id="bikeWrap">
+          <svg class="bikeSvg bikeGlow" viewBox="0 0 520 210" aria-label="Motorcycle attitude display">
+            <defs><linearGradient id="frameGrad" x1="0" x2="1"><stop id="frameColorA" stop-color="#55e6ff"/><stop id="frameColorB" offset="1" stop-color="#8967ff"/></linearGradient><linearGradient id="bodyGrad" x1="0" x2="1"><stop id="bikeColorA" stop-color="#1d86d9"/><stop id="bikeColorB" offset="1" stop-color="#6f4ed6"/></linearGradient></defs>
+            <circle class="wheel" cx="115" cy="155" r="48"/><circle class="rim" cx="115" cy="155" r="31"/>
+            <circle class="wheel" cx="410" cy="155" r="48"/><circle class="rim" cx="410" cy="155" r="31"/>
+            <path class="frame" d="M115 155 L210 143 L272 90 L332 145 L410 155 M210 143 L265 145 L332 145 M272 90 L245 68"/>
+            <path class="metal" d="M332 145 L370 73 L410 155 M370 73 L391 65 M245 68 L220 59"/>
+            <path class="bodyFill" d="M214 105 C231 82 278 73 319 84 L348 109 L316 126 L246 122 Z"/>
+            <path class="bodyFill" d="M214 104 L184 90 L169 101 L214 119 Z"/>
+            <path class="metal" d="M310 84 L337 62 L370 73"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="telemetry">
+        <div class="mini"><span>Measured pitch</span><strong id="rawPitch">0.0°</strong></div>
+        <div class="mini"><span>Baseline correction</span><strong id="baseline">0.0°</strong></div>
+      </div>
+      <span id="triggerPitch" hidden></span>
+    </section>
+
+    <section class="card side dashboardCard" id="telemetryCard">
+      <button class="fullExit" id="telemetryExit" type="button" aria-label="Exit full screen">×</button>
+      <h2>Live telemetry</h2>
+      <div class="stats">
+        <button class="stat modeControl" id="modeControl" type="button" aria-label="Tap to toggle armed state; hold five seconds to recalibrate"><span>Controller</span><strong id="mode">---</strong><span class="modeHint" id="modeHint">Tap to arm</span></button>
+        <div class="stat"><span>Output</span><strong id="output">0%</strong></div>
+        <div class="stat"><span>IMU</span><strong id="imu">---</strong></div>
+        <div class="stat"><span>Baseline</span><strong id="baselineState">---</strong></div>
+      </div>
+
+      <div class="peakGrid">
+        <div class="peak"><span>Highest angle</span><strong id="peakAngle">0.0°</strong><button class="peakReset" onclick="resetPeak('angle')" title="Reset highest angle">↺</button></div>
+        <div class="peak"><span>Highest +G</span><strong id="peakG">+0.00 g</strong><button class="peakReset" onclick="resetPeak('g')" title="Reset highest G load">↺</button></div>
+      </div>
+
+      <div class="meter"><div class="meterHead"><span>Pitch rate / selected gyro</span><strong id="gyro">0.0°/s</strong></div><div class="bar centerBar"><div class="gyroFill" id="gyroFill"></div></div></div>
+      <div class="meter"><div class="meterHead"><span>+G load</span><strong id="gload">+0.00 g</strong></div><div class="bar"><div class="barFill" id="gFill"></div></div></div>
+      <div class="meter"><div class="meterHead"><span>Trigger threshold</span><strong id="threshold">20.0°</strong></div><div class="bar"><div class="barFill" id="pitchFill"></div></div></div>
+
+      <div class="angleFlow">
+        <div class="angleBox"><small>RAW</small><strong id="raw2">0.0°</strong></div><div class="arrow">−</div>
+        <div class="angleBox"><small>BASE</small><strong id="base2">0.0°</strong></div><div class="arrow">=</div>
+        <div class="angleBox"><small>TRIGGER</small><strong id="trig2">0.0°</strong></div>
+      </div>
+      <canvas class="rideGraph" id="rideGraph" aria-label="Recent pitch history"></canvas>
+      <div class="eventStats"><div class="eventStat"><span>Wheelies this session</span><strong id="eventCount">0</strong></div><div class="eventStat"><span>Current duration</span><strong id="activeDuration">0.0 s</strong></div><div class="eventStat"><span>Last duration</span><strong id="lastDuration">0.0 s</strong></div><div class="eventStat"><span>Last peak</span><strong id="lastEventPeak">0.0° · +0.00 g</strong></div></div>
+    </section>
+  </main>
+  <div class="foot">1× display · 2× angle mode · 3× Wi-Fi AP · hold armed/standby · 30 s hold resets Wi-Fi password</div>
+</div>
+<script>
+let token='';const $=id=>document.getElementById(id);const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const plusG=v=>'+'+Math.max(0,v).toFixed(2)+' g';
+function gyroBar(v){v=clamp(v,-120,120);if(v>=0){$('gyroFill').style.left='50%';$('gyroFill').style.width=(v/120*50)+'%';}else{$('gyroFill').style.left=(50+v/120*50)+'%';$('gyroFill').style.width=(-v/120*50)+'%';}}
+const saved=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};
+const persist=(key,value)=>{try{localStorage.setItem(key,value)}catch(e){}};
+function setTheme(theme){document.body.dataset.theme=theme;persist('wheelieTheme',theme);$('themeIcon').innerHTML=theme==='light'?'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>':'<path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/>';}
+function shade(hex,amount){const n=parseInt(hex.slice(1),16),c=v=>Math.max(0,Math.min(255,v+amount)).toString(16).padStart(2,'0');return '#'+c(n>>16)+c((n>>8)&255)+c(n&255)}
+function setBikeColor(color){$('bikeColorA').setAttribute('stop-color',shade(color,25));$('bikeColorB').setAttribute('stop-color',shade(color,-45));$('frameColorA').setAttribute('stop-color',shade(color,55));$('frameColorB').setAttribute('stop-color',shade(color,-15))}
+function setPitchTape(enabled){document.body.classList.toggle('tapeEnabled',enabled);document.body.classList.toggle('tapeDisabled',!enabled)}
+let activeDashboardView=saved('wheelieDashboardView','controller');
+function setDashboardView(view){activeDashboardView=view==='telemetry'?'telemetry':'controller';persist('wheelieDashboardView',activeDashboardView);$('controllerCard').classList.toggle('activeView',activeDashboardView==='controller');$('telemetryCard').classList.toggle('activeView',activeDashboardView==='telemetry');$('controllerViewBtn').classList.toggle('active',activeDashboardView==='controller');$('telemetryViewBtn').classList.toggle('active',activeDashboardView==='telemetry');}
+function activeDashboardCard(){return $(activeDashboardView==='telemetry'?'telemetryCard':'controllerCard')}
+function setFullscreen(enabled){const card=activeDashboardCard();document.body.classList.toggle('fullscreenView',enabled);document.querySelectorAll('.dashboardCard').forEach(c=>c.classList.toggle('fullscreenActive',enabled&&c===card));if(enabled){const request=card.requestFullscreen||card.webkitRequestFullscreen;if(request)try{const result=request.call(card);if(result&&result.catch)result.catch(()=>{})}catch(e){}}else{const exit=document.exitFullscreen||document.webkitExitFullscreen;if((document.fullscreenElement||document.webkitFullscreenElement)&&exit)try{const result=exit.call(document);if(result&&result.catch)result.catch(()=>{})}catch(e){}}}
+$('controllerViewBtn').addEventListener('click',()=>setDashboardView('controller'));$('telemetryViewBtn').addEventListener('click',()=>setDashboardView('telemetry'));$('rideBtn').addEventListener('click',()=>setFullscreen(true));$('controllerExit').addEventListener('click',()=>setFullscreen(false));$('telemetryExit').addEventListener('click',()=>setFullscreen(false));document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)document.body.classList.remove('fullscreenView')});document.addEventListener('webkitfullscreenchange',()=>{if(!document.webkitFullscreenElement)document.body.classList.remove('fullscreenView')});setDashboardView(activeDashboardView);
+const rideSamples=[];
+function drawRideGraph(data){rideSamples.push({p:data.pitch,t:data.trigger,w:data.warningAngle});if(rideSamples.length>120)rideSamples.shift();const canvas=$('rideGraph'),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(240,canvas.clientWidth),h=canvas.clientHeight;canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);const maxY=Math.max(60,...rideSamples.map(s=>Math.max(s.p,s.w)))+5,toY=v=>h-8-(Math.max(0,v)/maxY)*(h-16);c.strokeStyle=getComputedStyle(document.body).getPropertyValue('--line');c.lineWidth=1;[0,20,40,60].forEach(v=>{c.beginPath();c.moveTo(0,toY(v));c.lineTo(w,toY(v));c.stroke()});const threshold=(key,color)=>{if(!rideSamples.length)return;c.strokeStyle=color;c.setLineDash([5,4]);c.beginPath();c.moveTo(0,toY(rideSamples[rideSamples.length-1][key]));c.lineTo(w,toY(rideSamples[rideSamples.length-1][key]));c.stroke();c.setLineDash([])};threshold('t','#4ca6ff');threshold('w','#ef4444');c.strokeStyle='#55e6ff';c.lineWidth=2;c.beginPath();rideSamples.forEach((s,i)=>{const x=i/Math.max(1,rideSamples.length-1)*w,y=toY(s.p);i?c.lineTo(x,y):c.moveTo(x,y)});c.stroke()}
+async function refreshRideData(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();$('eventCount').textContent=d.eventCount;$('activeDuration').textContent=(d.activeDuration/1000).toFixed(1)+' s';$('lastDuration').textContent=(d.lastDuration/1000).toFixed(1)+' s';$('lastEventPeak').textContent=d.lastPeakAngle.toFixed(1)+'° · +'+d.lastPeakG.toFixed(2)+' g';drawRideGraph(d)}catch(e){}}
+const stageEffectPrefs={wheelieMode:saved('wheelieEffectMode','off'),wheelieColor:saved('wheelieEffectColor','#22c55e'),warningMode:saved('warningEffectMode','off'),warningColor:saved('warningEffectColor','#ef4444'),warningAngle:clamp(parseFloat(saved('warningEffectAngle','15'))||15,0,70)};
+function updateStageEffect(){const stage=$('bikeStage'),isWheelie=$('state').textContent==='WHEELIE',angle=parseFloat($('pitch').textContent)||0;let mode='off',color='transparent';if(angle>=stageEffectPrefs.warningAngle&&stageEffectPrefs.warningMode!=='off'){mode=stageEffectPrefs.warningMode;color=stageEffectPrefs.warningColor}else if(isWheelie&&stageEffectPrefs.wheelieMode!=='off'){mode=stageEffectPrefs.wheelieMode;color=stageEffectPrefs.wheelieColor}stage.classList.toggle('effectSolid',mode==='solid');stage.classList.toggle('effectFlash',mode==='flash');stage.style.setProperty('--stage-effect-color',color)}
+$('themeBtn').addEventListener('click',()=>setTheme(document.body.dataset.theme==='light'?'dark':'light'));
+setTheme(saved('wheelieTheme','dark'));setBikeColor(saved('wheelieBikeColor','#4ca6ff'));setPitchTape(saved('wheeliePitchTape','on')!=='off');
+new MutationObserver(()=>{const armed=$('mode').textContent==='ARMED';$('mode').className=armed?'statusGood':'statusWarn';$('modeHint').textContent=armed?'Tap to disarm':'Tap to arm';}).observe($('mode'),{childList:true});
+new MutationObserver(()=>{const angle=clamp(parseFloat($('pitch').textContent)||0,-60,60);$('pitchTape').style.transform='translateY('+(angle*3)+'px)';updateStageEffect()}).observe($('pitch'),{childList:true});
+new MutationObserver(updateStageEffect).observe($('state'),{childList:true});
+async function toggleMode(){if(!token)return;const button=$('modeControl'),next=$('mode').textContent==='ARMED'?'standby':'armed';button.disabled=true;try{const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+next,{method:'POST'});if(!r.ok)alert(await r.text());await refresh();}catch(e){alert('Controller connection lost');}finally{button.disabled=false}}
+let modeHoldStarted=0,modeHoldFrame=0,modeHoldTriggered=false;
+function clearModeHold(){cancelAnimationFrame(modeHoldFrame);modeHoldStarted=0;$('modeControl').classList.remove('holding');$('modeControl').style.setProperty('--hold-progress','0%')}
+async function recalibrateFromTile(){if(!confirm('Recalibrate the controller now? Keep the motorcycle level and completely still.'))return;const button=$('modeControl');button.disabled=true;try{const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});alert(await r.text());await refresh();}catch(e){alert('Calibration request failed')}finally{button.disabled=false}}
+function updateModeHold(now){if(!modeHoldStarted)return;const progress=Math.min(100,(now-modeHoldStarted)/50);$('modeControl').style.setProperty('--hold-progress',progress+'%');if(progress>=100){modeHoldTriggered=true;clearModeHold();recalibrateFromTile();return}modeHoldFrame=requestAnimationFrame(updateModeHold)}
+$('modeControl').addEventListener('pointerdown',e=>{if(e.button!==0||$('modeControl').disabled)return;modeHoldTriggered=false;modeHoldStarted=performance.now();$('modeControl').classList.add('holding');$('modeControl').setPointerCapture(e.pointerId);modeHoldFrame=requestAnimationFrame(updateModeHold)});
+$('modeControl').addEventListener('pointerup',()=>{const shouldToggle=modeHoldStarted&&!modeHoldTriggered;clearModeHold();if(shouldToggle)toggleMode()});
+$('modeControl').addEventListener('pointercancel',clearModeHold);
+$('modeControl').addEventListener('contextmenu',e=>e.preventDefault());
+$('modeControl').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.repeat){e.preventDefault();toggleMode()}});
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('pitch').textContent=d.pitch.toFixed(1)+'°';$('rawPitch').textContent=d.rawPitch.toFixed(1)+'°';$('baseline').textContent=d.baseline.toFixed(1)+'°';$('triggerPitch').textContent=d.pitch.toFixed(1)+'°';$('raw2').textContent=d.rawPitch.toFixed(1)+'°';$('base2').textContent=d.baseline.toFixed(1)+'°';$('trig2').textContent=d.pitch.toFixed(1)+'°';$('state').textContent=d.state;$('state').className=d.state==='WHEELIE'?'statusGood':d.state==='PENDING'?'statusWarn':'';$('mode').textContent=d.mode;$('output').textContent=d.output+'%';$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('baselineState').textContent=d.angleMode==='adaptive'?(d.baselineFrozen?'FROZEN':'TRACKING'):'FIXED';$('angleModeLine').textContent=d.angleMode.toUpperCase()+' angle mode';$('gyro').textContent=d.gyroRate.toFixed(1)+'°/s';$('gload').textContent=plusG(d.gLoad);$('peakAngle').textContent=d.peakAngle.toFixed(1)+'°';$('peakG').textContent=plusG(d.peakG);$('threshold').textContent=d.trigger.toFixed(1)+'°';gyroBar(d.gyroRate);$('gFill').style.width=clamp(d.gLoad/2.0*100,0,100)+'%';$('pitchFill').style.width=clamp(Math.max(0,d.pitch)/Math.max(1,d.trigger)*100,0,100)+'%';$('bikeWrap').style.transform='translate(-50%,-50%) rotate('+(-clamp(d.rawPitch,-55,55))+'deg)';$('connDot').style.background='var(--green)';$('connText').textContent='Connected';}catch(e){$('connDot').style.background='var(--red)';$('connText').textContent='Disconnected';}}
+async function resetPeak(kind){if(!token)return;try{await fetch('/api/peak/reset?token='+encodeURIComponent(token)+'&kind='+encodeURIComponent(kind),{method:'POST'});refresh();}catch(e){}}
+refresh();refreshRideData();setInterval(refresh,150);setInterval(refreshRideData,250);
+</script>
+</body>
+</html>
+)rawliteral";
+
+const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Wheelie Settings</title>
+<style>
+:root{color-scheme:dark;--bg:#080b10;--panel:#111720;--line:#273449;--text:#f4f7fb;--muted:#8f9bad;--accent:#4ea1ff;--accent2:#8f66ff;--good:#52df9a;--warn:#ffc857;--bad:#ff6577}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0,rgba(78,161,255,.18),transparent 30%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{width:min(940px,100%);margin:auto;padding:16px}.top{display:flex;align-items:center;gap:10px;margin:4px 0 15px}.back{width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--line);border-radius:13px;background:#111720;color:white;text-decoration:none;font-size:24px}.title h1{font-size:25px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:13px}.card{grid-column:span 12;background:linear-gradient(180deg,#151d28,#0f151e);border:1px solid var(--line);border-radius:18px;padding:17px}@media(min-width:740px){.half{grid-column:span 6}}h2{font-size:15px;margin:0 0 13px}.rows{display:grid}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}.row span,label{color:var(--muted)}label{display:block;font-size:12px;margin:12px 0 6px}input,select{width:100%;padding:12px;border-radius:11px;border:1px solid var(--line);background:#090e15;color:white;font:inherit}.range{display:grid;grid-template-columns:1fr 78px;gap:9px;align-items:center}.range input{padding:0}.range output{text-align:center;background:#090e15;border:1px solid var(--line);border-radius:10px;padding:9px 4px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.wide{grid-column:1/-1}button{border:0;border-radius:11px;padding:13px;font:inherit;font-weight:750;background:#29364a;color:white;cursor:pointer}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2))}.good{background:#173b2d;color:#7cf5b9;border:1px solid #245c43}.warn{background:#3b3118;color:#ffd978;border:1px solid #665326}.bad{background:#421e27;color:#ff9dab;border:1px solid #6d2f3d}.note{font-size:12px;line-height:1.5;color:var(--muted)}.message{position:sticky;bottom:10px;width:max-content;max-width:100%;margin:14px auto 0;padding:9px 14px;background:#121a25;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}.hidden{display:none}.file{border-style:dashed}.statusGood{color:var(--good)}.statusBad{color:var(--bad)}
+</style>
+</head>
+<body><div class="wrap">
+<header class="top"><a class="back" href="/" aria-label="Dashboard">‹</a><div class="title"><h1>Controller Settings</h1><p>Configuration, service controls & firmware</p></div></header>
+<div class="grid">
+<section class="card half"><h2>Wheelie Detection</h2><label>Angle processing mode</label><select id="angleMode"><option value="absolute">Absolute — fixed calibration zero</option><option value="adaptive">Adaptive — follows gradual terrain</option></select><div id="adaptiveSettings"><label>Adaptive zero time constant (seconds)</label><input id="adaptiveTau" type="number" min="0.5" max="60" step="0.5"><label>Freeze baseline above pitch rate (°/sec)</label><input id="freezeRate" type="number" min="1" max="100" step="0.5"><p class="note">The adaptive baseline follows hills slowly, but freezes during rapid pitch changes and wheelie detection.</p></div><label>Trigger angle (°)</label><input id="trigger" type="number" min="5" max="70" step="0.5"><label>Reset angle (°)</label><input id="reset" type="number" min="0" max="69" step="0.5"><label>Trigger hold (ms)</label><input id="hold" type="number" min="0" max="5000" step="10"><label>Minimum ON time (ms)</label><input id="minon" type="number" min="0" max="15000" step="50"></section>
+<section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
+<section class="card half"><h2>Sensor Mounting</h2><label for="rotationAxis">Pitch rotation axis</label><select id="rotationAxis"><option value="x">X axis</option><option value="y">Y axis — standard mounting</option><option value="z">Z axis</option></select><p class="note">Choose the MPU6050 gyro axis aligned with the motorcycle's pitch rotation. Changing this setting invalidates the current calibration and leaves the controller in STANDBY until recalibrated.</p></section>
+<section class="card half"><h2>Dashboard Appearance</h2><label for="bikeColor">Motorcycle accent color</label><div style="display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center"><input id="bikeColor" type="color" value="#4ca6ff" style="height:54px;padding:5px;cursor:pointer"><div id="colorSwatch" style="height:54px;border-radius:11px;border:1px solid var(--line);background:var(--bikePreview);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div></div><label for="pitchTapeSetting">Pitch tape</label><select id="pitchTapeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><div class="actions"><button class="wide" type="button" onclick="resetBikeColor()">Reset Default Color</button></div><p class="note">Appearance preferences are stored by this browser and apply to the dashboard on this device.</p></section>
+<section class="card half"><h2>Pitch Display Alerts</h2><label for="wheelieEffectMode">Wheelie background</label><select id="wheelieEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><label for="wheelieEffectColor">Wheelie color</label><input id="wheelieEffectColor" type="color" value="#22c55e" style="height:48px;padding:5px;cursor:pointer"><label for="warningEffectMode">Angle warning background</label><select id="warningEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><div style="display:grid;grid-template-columns:1fr 82px;gap:10px"><div><label for="warningEffectAngle">Warning angle (°)</label><input id="warningEffectAngle" type="number" min="0" max="70" step="0.5" value="15"></div><div><label for="warningEffectColor">Color</label><input id="warningEffectColor" type="color" value="#ef4444" style="height:48px;padding:5px;cursor:pointer"></div></div><p class="note">Both effects are disabled by default. The high-angle warning takes priority whenever its threshold is reached.</p></section>
+<section class="card half"><h2>Physical Light Patterns</h2><label for="wheeliePattern">Wheelie pattern</label><select id="wheeliePattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningPattern">High-angle warning pattern</label><select id="warningPattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningBrightness">Warning brightness</label><div class="range"><input id="warningBrightness" type="range" min="1" max="100"><output id="warningBrightnessOut">100%</output></div><label for="warningAngleFirmware">Warning activation angle (°)</label><input id="warningAngleFirmware" type="number" min="5" max="85" step="0.5"><label for="warningResetFirmware">Warning release angle (°)</label><input id="warningResetFirmware" type="number" min="0" max="84" step="0.5"><label for="warningRateFirmware">Early warning pitch rate (°/s, 0 disables)</label><input id="warningRateFirmware" type="number" min="0" max="250" step="1"><p class="note">The warning uses angle hysteresis to prevent chatter. A rapid rise can activate it early after the normal wheelie threshold is crossed.</p></section>
+<section class="card half"><h2>Controller</h2><div class="rows"><div class="row"><span>Current mode</span><strong id="mode">---</strong></div><div class="row"><span>IMU</span><strong id="imu">---</strong></div><div class="row"><span>Angle mode</span><strong id="angleModeLive">---</strong></div><div class="row"><span>Current +G load</span><strong id="gload">---</strong></div></div><div class="actions"><button class="good" onclick="setMode('armed')">ARM</button><button class="warn" onclick="setMode('standby')">STANDBY</button><button class="bad wide" onclick="calibrate()">Recalibrate Level</button></div><p class="note">Engine-idle vibration is acceptable during calibration as long as the motorcycle remains stationary and is not being rocked.</p></section>
+<section class="card half"><h2>Manual Output Test</h2><div class="actions"><button onclick="testOutput(25)">25%</button><button onclick="testOutput(50)">50%</button><button onclick="testOutput(75)">75%</button><button onclick="testOutput(100)">100%</button><button class="bad wide" onclick="testOutput(0)">OFF</button></div><p class="note">Only available in STANDBY. Non-zero test commands automatically expire after 10 seconds.</p></section>
+<section class="card half"><h2>Network & System</h2><div class="rows"><div class="row"><span>Access point</span><strong id="apState">ON</strong></div><div class="row"><span>SSID</span><strong id="apSsid">---</strong></div><div class="row"><span>Friendly address</span><strong>wheelie.local</strong></div><div class="row"><span>Guaranteed fallback</span><strong>192.168.4.1</strong></div><div class="row"><span>Discovery</span><strong id="discovery">---</strong></div><div class="row"><span>Clients</span><strong id="clients">0</strong></div><div class="row"><span>Uptime</span><strong id="uptime">0 sec</strong></div><div class="row"><span>Firmware</span><strong id="firmware">---</strong></div></div><label>Wi-Fi password</label><input id="wifiPassword" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="Enter a new 8-63 character password"><div class="actions"><button class="primary wide" onclick="saveWifiPassword()">Update Wi-Fi Password</button></div><p class="note">Changing the password restarts the access point and disconnects this browser. Reconnect to the SSID shown above with the new password. Hold the physical button for <b>30 seconds</b> at any time to restore the default password <b>wheeliectrl</b> and turn the AP back on.</p><p class="note"><b>Triple-tap</b> toggles the access point. v0.11 also runs mDNS plus a captive DNS/portal fallback; if <b>wheelie.local</b> is not supported by the phone, the portal should open automatically or you can always use <b>192.168.4.1</b>.</p></section>
+<section class="card half"><h2>Configuration Backup</h2><div class="actions"><button onclick="exportSettings()">Export JSON</button><button onclick="$('settingsFile').click()">Import JSON</button></div><input class="file hidden" id="settingsFile" type="file" accept=".json,application/json"><p class="note">Export includes controller settings and browser-local dashboard appearance. Imported values are validated by the controller when applied.</p></section>
+<section class="card half"><h2>Firmware Update & Recovery</h2><input class="file" id="firmwareFile" type="file" accept=".bin,application/octet-stream"><div class="actions"><button class="primary wide" onclick="uploadFirmware()">Upload OTA Firmware</button><button class="bad wide" onclick="rollbackFirmware()">Return to Previous Firmware</button></div><p class="note">The output is forced OFF during updates and rollback. The previous image remains in the alternate OTA partition until another update replaces it.</p></section>
+</div><div class="message" id="message">Ready</div></div>
+<script>
+let token='',settingsLoaded=false,axisLoaded=false,advancedLoaded=false;const $=id=>document.getElementById(id);const msg=t=>$('message').textContent=t;function syncAdaptive(){$('adaptiveSettings').classList.toggle('hidden',$('angleMode').value!=='adaptive');}$('angleMode').addEventListener('change',syncAdaptive);$('brightness').addEventListener('input',()=>$('brightnessOut').textContent=$('brightness').value+'%');$('fade').addEventListener('input',()=>$('fadeOut').textContent=$('fade').value+' ms');$('warningBrightness').addEventListener('input',()=>$('warningBrightnessOut').textContent=$('warningBrightness').value+'%');
+const savedBikeColor=(()=>{try{return localStorage.getItem('wheelieBikeColor')||'#4ca6ff'}catch(e){return '#4ca6ff'}})();
+function applyBikeColor(color){$('bikeColor').value=color;$('colorSwatch').style.setProperty('--bikePreview',color);try{localStorage.setItem('wheelieBikeColor',color)}catch(e){}}
+function resetBikeColor(){applyBikeColor('#4ca6ff');msg('Dashboard bike color reset')}
+$('bikeColor').addEventListener('input',e=>applyBikeColor(e.target.value));applyBikeColor(savedBikeColor);
+let savedPitchTape='on';try{savedPitchTape=localStorage.getItem('wheeliePitchTape')||'on'}catch(e){}$('pitchTapeSetting').value=savedPitchTape;$('pitchTapeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheeliePitchTape',e.target.value)}catch(err){}msg('Pitch tape preference saved')});
+const localValue=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};const effectFields={wheelieEffectMode:'off',wheelieEffectColor:'#22c55e',warningEffectMode:'off',warningEffectAngle:'15',warningEffectColor:'#ef4444'};Object.entries(effectFields).forEach(([id,fallback])=>{$(id).value=localValue(id,fallback);$(id).addEventListener('change',e=>{let value=e.target.value;if(id==='warningEffectAngle'){value=String(Math.max(0,Math.min(70,parseFloat(value)||15)));e.target.value=value}try{localStorage.setItem(id,value)}catch(err){}msg('Pitch alert preference saved')})});
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
+async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();}
+async function setMode(mode){const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+mode,{method:'POST'});msg(await r.text());refresh();}
+async function calibrate(){msg('Calibrating — keep bike stationary...');const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());refresh();}
+async function refreshSsid(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();$('apSsid').textContent=d.ssid;if(!axisLoaded){$('rotationAxis').value=d.rotationAxis;axisLoaded=true;}if(!advancedLoaded){$('wheeliePattern').value=d.wheeliePattern;$('warningPattern').value=d.warningPattern;$('warningBrightness').value=d.warningBrightness;$('warningBrightnessOut').textContent=d.warningBrightness+'%';$('warningAngleFirmware').value=d.warningAngle;$('warningResetFirmware').value=d.warningReset;$('warningRateFirmware').value=d.warningRate;advancedLoaded=true;}}catch(e){}}
+async function testOutput(level){const r=await fetch('/api/output?token='+encodeURIComponent(token)+'&level='+level,{method:'POST'});msg(await r.text());refresh();}
+async function saveWifiPassword(){const p=$('wifiPassword').value;if(p.length<8||p.length>63){msg('Wi-Fi password must be 8-63 characters');return;}if(!confirm('Change Wi-Fi password? You will need to reconnect.'))return;const body=new URLSearchParams({password:p});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());$('wifiPassword').value='';}catch(e){msg('Password saved; reconnect to the controller AP');}}
+function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
+$('settingsFile').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());if(data.format!=='wheelie-controller-settings'||!data.controller)throw new Error('Unsupported settings file');Object.entries(data.controller).forEach(([id,value])=>{if($(id))$(id).value=value});if(data.appearance)Object.entries(data.appearance).forEach(([key,value])=>{if(value!==null)localStorage.setItem(key,value)});$('brightnessOut').textContent=$('brightness').value+'%';$('fadeOut').textContent=$('fade').value+' ms';$('warningBrightnessOut').textContent=$('warningBrightness').value+'%';if(confirm('Settings loaded. Apply them to the controller now?'))await saveSettings();else msg('Settings loaded for review; use Save Settings to apply')}catch(err){msg('Import failed: '+err.message)}e.target.value=''});
+async function rollbackFirmware(){if(!confirm('Reboot into the previous firmware image?'))return;try{const r=await fetch('/api/rollback?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text())}catch(e){msg('Controller is rebooting or rollback failed')}}
+async function uploadFirmware(){const f=$('firmwareFile').files[0];if(!f){msg('Choose firmware.bin first');return;}if(!confirm('Upload '+f.name+' and reboot the controller?'))return;const form=new FormData();form.append('update',f,f.name);msg('Uploading firmware — do not remove power...');try{const r=await fetch('/api/update?token='+encodeURIComponent(token),{method:'POST',body:form});msg(await r.text());}catch(e){msg('Controller rebooting — reconnect shortly');}}
+refresh();refreshSsid();setInterval(refresh,500);setInterval(refreshSsid,5000);
+</script></body></html>
+)rawliteral";
+
+// =====================================================
+// WEB API
+// =====================================================
+
+void handleRoot() {
+    server.send_P(200, "text/html", DASHBOARD_HTML);
+}
+
+void handleSettingsPage() {
+    server.send_P(200, "text/html", SETTINGS_HTML);
+}
+
+void handleCaptivePortalRedirect() {
+    // Give connectivity assistants a canonical local destination. In
+    // particular, Windows NCSI may otherwise continue from its failed probe
+    // to msftconnecttest.com/redirect and then open the MSN portal.
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(302, "text/plain", "Open Wheelie Controller");
+}
+
+void handleStatus() {
+    int outputPercent = (outputBrightness * 100) / 255;
+    int brightnessPercent = (settings.brightness * 100) / 255;
+
+    String json = "{";
+    json += "\"pitch\":" + String(currentTriggerPitch, 2);
+    json += ",\"rawPitch\":" + String(currentAbsolutePitch, 2);
+    json += ",\"baseline\":" + String(adaptiveBaseline, 2);
+    json += ",\"gyroRate\":" + String(currentGyroRate, 2);
+    json += ",\"gLoad\":" + String(currentGLoad, 3);
+    json += ",\"peakAngle\":" + String(highestAngle, 2);
+    json += ",\"peakG\":" + String(highestGLoad, 3);
+    json += ",\"warningActive\":" + String(highAngleWarningActive ? "true" : "false");
+    json += ",\"warningAngle\":" + String(settings.warningAngle, 1);
+    json += ",\"warningReset\":" + String(settings.warningResetAngle, 1);
+    json += ",\"warningRate\":" + String(settings.warningPitchRateDegSec, 1);
+    json += ",\"wheeliePattern\":" + String(static_cast<uint8_t>(settings.wheeliePattern));
+    json += ",\"warningPattern\":" + String(static_cast<uint8_t>(settings.warningPattern));
+    json += ",\"warningBrightness\":" + String((settings.warningBrightness * 100) / 255);
+    json += ",\"eventCount\":" + String(completedWheelieCount);
+    json += ",\"activeDuration\":" + String(controllerState == ControllerState::WHEELIE ? millis() - wheelieStartTime : 0);
+    json += ",\"lastDuration\":" + String(lastWheelieDurationMs);
+    json += ",\"lastPeakAngle\":" + String(lastWheeliePeakAngle, 1);
+    json += ",\"lastPeakG\":" + String(lastWheeliePeakG, 2);
+    json += ",\"accelX\":" + String(currentAccelX, 3);
+    json += ",\"accelY\":" + String(currentAccelY, 3);
+    json += ",\"accelZ\":" + String(currentAccelZ, 3);
+    json += ",\"baselineFrozen\":" + String(adaptiveBaselineFrozen ? "true" : "false");
+    json += ",\"mode\":\"" + String(getModeName()) + "\"";
+    json += ",\"state\":\"" + String(getStateName()) + "\"";
+    json += ",\"output\":" + String(outputPercent);
+    json += ",\"imu\":" + String(imuHealthy ? "true" : "false");
+    json += ",\"angleMode\":\"" + String(settings.angleMode == AngleMode::ADAPTIVE ? "adaptive" : "absolute") + "\"";
+    json += ",\"rotationAxis\":\"" + String(
+        rotationAxis == RotationAxis::X ? "x" :
+        (rotationAxis == RotationAxis::Z ? "z" : "y")
+    ) + "\"";
+    json += ",\"adaptiveTau\":" + String(settings.adaptiveTimeConstantSec, 1);
+    json += ",\"freezeRate\":" + String(settings.adaptiveFreezeRateDegSec, 1);
+    json += ",\"trigger\":" + String(settings.triggerAngle, 1);
+    json += ",\"reset\":" + String(settings.resetAngle, 1);
+    json += ",\"hold\":" + String(settings.triggerHoldMs);
+    json += ",\"minon\":" + String(settings.minimumOnTimeMs);
+    json += ",\"brightness\":" + String(brightnessPercent);
+    json += ",\"fade\":" + String(settings.fadeMs);
+    json += ",\"bootArmed\":" + String(settings.bootArmed ? "true" : "false");
+    json += ",\"apEnabled\":" + String(accessPointEnabled ? "true" : "false");
+    json += ",\"ssid\":\"" + wifiApSsid + "\"";
+    json += ",\"mdns\":" + String(mdnsHealthy ? "true" : "false");
+    json += ",\"dns\":" + String(dnsHealthy ? "true" : "false");
+    json += ",\"clients\":" + String(accessPointEnabled ? WiFi.softAPgetStationNum() : 0);
+    json += ",\"uptime\":" + String(millis() / 1000);
+    json += ",\"firmware\":\"" + String(FIRMWARE_VERSION) + "\"";
+    json += ",\"calOneGRaw\":" + String(calibrationRestMagnitudeRaw, 4);
+    json += ",\"calAccelRms\":" + String(calibrationAccelNoiseRms, 4);
+    json += ",\"calGyroRms\":" + String(calibrationGyroNoiseRms, 2);
+    json += ",\"calHighVibration\":" + String(calibrationHighVibration ? "true" : "false");
+    json += ",\"token\":\"" + writeToken + "\"";
+    json += "}";
+
+    server.send(200, "application/json", json);
+}
+
+void handleSettings() {
+    if (!requireWriteToken()) return;
+
+    const char* required[] = {
+        "angleMode", "rotationAxis", "adaptiveTau", "freezeRate", "trigger", "reset",
+        "hold", "minon", "brightness", "fade", "bootMode", "wheeliePattern",
+        "warningPattern", "warningBrightness", "warningAngle", "warningReset", "warningRate"
+    };
+
+    for (const char* key : required) {
+        if (!server.hasArg(key)) {
+            server.send(400, "text/plain", String("Missing setting: ") + key);
+            return;
+        }
+    }
+
+    String angleMode = server.arg("angleMode");
+    String newRotationAxis = server.arg("rotationAxis");
+    float newAdaptiveTau = server.arg("adaptiveTau").toFloat();
+    float newFreezeRate = server.arg("freezeRate").toFloat();
+    float newTrigger = server.arg("trigger").toFloat();
+    float newReset = server.arg("reset").toFloat();
+    uint32_t newHold = (uint32_t)server.arg("hold").toInt();
+    uint32_t newMinOn = (uint32_t)server.arg("minon").toInt();
+    int newBrightnessPercent = server.arg("brightness").toInt();
+    uint32_t newFade = (uint32_t)server.arg("fade").toInt();
+    String bootMode = server.arg("bootMode");
+    int newWheeliePattern = server.arg("wheeliePattern").toInt();
+    int newWarningPattern = server.arg("warningPattern").toInt();
+    int newWarningBrightnessPercent = server.arg("warningBrightness").toInt();
+    float newWarningAngle = server.arg("warningAngle").toFloat();
+    float newWarningReset = server.arg("warningReset").toFloat();
+    float newWarningRate = server.arg("warningRate").toFloat();
+
+    if (angleMode != "absolute" && angleMode != "adaptive") {
+        server.send(400, "text/plain", "Invalid angle mode");
+        return;
+    }
+
+    if (newRotationAxis != "x" && newRotationAxis != "y" && newRotationAxis != "z") {
+        server.send(400, "text/plain", "Invalid rotation axis");
+        return;
+    }
+
+    if (newAdaptiveTau < 0.5f || newAdaptiveTau > 60.0f) {
+        server.send(400, "text/plain", "Adaptive time must be 0.5-60 seconds");
+        return;
+    }
+
+    if (newFreezeRate < 1.0f || newFreezeRate > 100.0f) {
+        server.send(400, "text/plain", "Freeze rate must be 1-100 deg/sec");
+        return;
+    }
+
+    if (newTrigger < 5.0f || newTrigger > 70.0f) {
+        server.send(400, "text/plain", "Trigger must be 5-70 degrees");
+        return;
+    }
+
+    if (newReset < 0.0f || newReset >= newTrigger) {
+        server.send(400, "text/plain", "Reset must be below trigger");
+        return;
+    }
+
+    if (newHold > 5000) {
+        server.send(400, "text/plain", "Trigger hold must be 0-5000 ms");
+        return;
+    }
+
+    if (newMinOn > 15000) {
+        server.send(400, "text/plain", "Minimum ON must be 0-15000 ms");
+        return;
+    }
+
+    if (newBrightnessPercent < 1 || newBrightnessPercent > 100) {
+        server.send(400, "text/plain", "Brightness must be 1-100%");
+        return;
+    }
+
+    if (newFade > 3000) {
+        server.send(400, "text/plain", "Fade must be 0-3000 ms");
+        return;
+    }
+
+    if (bootMode != "armed" && bootMode != "standby") {
+        server.send(400, "text/plain", "Invalid boot mode");
+        return;
+    }
+
+    if (newWheeliePattern < 0 || newWheeliePattern > 4 ||
+        newWarningPattern < 0 || newWarningPattern > 4) {
+        server.send(400, "text/plain", "Invalid light pattern");
+        return;
+    }
+    if (newWarningBrightnessPercent < 1 || newWarningBrightnessPercent > 100 ||
+        newWarningAngle < 5.0f || newWarningAngle > 85.0f ||
+        newWarningReset < 0.0f || newWarningReset >= newWarningAngle ||
+        newWarningRate < 0.0f || newWarningRate > 250.0f) {
+        server.send(400, "text/plain", "Invalid warning configuration");
+        return;
+    }
+
+    RotationAxis selectedRotationAxis = newRotationAxis == "x" ? RotationAxis::X :
+        (newRotationAxis == "z" ? RotationAxis::Z : RotationAxis::Y);
+    bool rotationAxisChanged = selectedRotationAxis != rotationAxis;
+    rotationAxis = selectedRotationAxis;
+    settings.angleMode = angleMode == "adaptive" ? AngleMode::ADAPTIVE : AngleMode::ABSOLUTE;
+    settings.adaptiveTimeConstantSec = newAdaptiveTau;
+    settings.adaptiveFreezeRateDegSec = newFreezeRate;
+    settings.triggerAngle = newTrigger;
+    settings.resetAngle = newReset;
+    settings.triggerHoldMs = newHold;
+    settings.minimumOnTimeMs = newMinOn;
+    settings.brightness = (uint8_t)map(newBrightnessPercent, 1, 100, 3, 255);
+    settings.fadeMs = newFade;
+    settings.bootArmed = bootMode == "armed";
+    settings.wheeliePattern = static_cast<LightPattern>(newWheeliePattern);
+    settings.warningPattern = static_cast<LightPattern>(newWarningPattern);
+    settings.warningBrightness = (uint8_t)map(newWarningBrightnessPercent, 1, 100, 3, 255);
+    settings.warningAngle = newWarningAngle;
+    settings.warningResetAngle = newWarningReset;
+    settings.warningPitchRateDegSec = newWarningRate;
+
+    controllerState = ControllerState::NORMAL;
+    forceOutputOff();
+    resetAdaptiveBaselineToCurrent();
+    saveSettings();
+
+    if (rotationAxisChanged) {
+        setOperatingMode(OperatingMode::STANDBY);
+        imuHealthy = false;
+    }
+
+    oled.clearDisplay();
+    displayDirty = true;
+    server.send(200, "text/plain", rotationAxisChanged ?
+        "Settings saved. Rotation axis changed; recalibrate before arming." :
+        "Settings saved");
+}
+
+void handleMode() {
+    if (!requireWriteToken()) return;
+
+    if (!server.hasArg("mode")) {
+        server.send(400, "text/plain", "Missing mode");
+        return;
+    }
+
+    String mode = server.arg("mode");
+
+    if (mode == "armed") {
+        if (!imuHealthy) {
+            server.send(409, "text/plain", "Cannot arm: IMU fault");
+            return;
+        }
+        setOperatingMode(OperatingMode::ARMED);
+        server.send(200, "text/plain", "Controller ARMED");
+    } else if (mode == "standby") {
+        setOperatingMode(OperatingMode::STANDBY);
+        server.send(200, "text/plain", "Controller STANDBY");
+    } else {
+        server.send(400, "text/plain", "Invalid mode");
+    }
+}
+
+void handleCalibration() {
+    if (!requireWriteToken()) return;
+
+    OperatingMode previousMode = operatingMode;
+    setOperatingMode(OperatingMode::STANDBY);
+
+    bool success = calibrateMPU();
+
+    if (success && previousMode == OperatingMode::ARMED) {
+        setOperatingMode(OperatingMode::ARMED);
+    } else {
+        setOperatingMode(OperatingMode::STANDBY);
+    }
+
+    server.send(
+        success ? 200 : 500,
+        "text/plain",
+        success ? "Calibration complete" : "Calibration failed — controller left in STANDBY"
+    );
+}
+
+void handleManualOutput() {
+    if (!requireWriteToken()) return;
+
+    if (operatingMode != OperatingMode::STANDBY) {
+        server.send(409, "text/plain", "Manual output is only allowed in STANDBY");
+        return;
+    }
+
+    if (!server.hasArg("level")) {
+        server.send(400, "text/plain", "Missing output level");
+        return;
+    }
+
+    int level = server.arg("level").toInt();
+
+    if (level < 0 || level > 100) {
+        server.send(400, "text/plain", "Output level must be 0-100%");
+        return;
+    }
+
+    controllerState = ControllerState::NORMAL;
+
+    if (level == 0) {
+        manualTestActive = false;
+        setOutputTarget(0);
+        server.send(200, "text/plain", "Manual output OFF");
+    } else {
+        manualTestActive = true;
+        manualTestStartMs = millis();
+        uint8_t value = (uint8_t)map(level, 1, 100, 3, 255);
+        setOutputTarget(value);
+        server.send(200, "text/plain", String("Manual output ") + level + "% for up to 10 seconds");
+    }
+
+    displayDirty = true;
+}
+
+void handlePeakReset() {
+    if (!requireWriteToken()) return;
+
+    if (!server.hasArg("kind")) {
+        server.send(400, "text/plain", "Missing peak type");
+        return;
+    }
+
+    String kind = server.arg("kind");
+    if (kind == "angle") {
+        highestAngle = max(0.0f, currentTriggerPitch);
+        server.send(200, "text/plain", "Highest angle reset");
+    } else if (kind == "g") {
+        highestGLoad = currentGLoad;
+        server.send(200, "text/plain", "Highest +G reset");
+    } else {
+        server.send(400, "text/plain", "Invalid peak type");
+    }
+}
+
+void handleWiFiPassword() {
+    if (!requireWriteToken()) return;
+
+    if (!server.hasArg("password")) {
+        server.send(400, "text/plain", "Missing password");
+        return;
+    }
+
+    String newPassword = server.arg("password");
+    if (newPassword.length() < 8 || newPassword.length() > 63) {
+        server.send(400, "text/plain", "Wi-Fi password must be 8-63 characters");
+        return;
+    }
+
+    if (newPassword == wifiApPassword) {
+        server.send(200, "text/plain", "Wi-Fi password unchanged");
+        return;
+    }
+
+    wifiApPassword = newPassword;
+    saveSettings();
+
+    if (accessPointEnabled) {
+        scheduleAccessPointRestart(1200);
+        server.send(200, "text/plain", "Password saved. Access point restarting — reconnect with the new password.");
+    } else {
+        server.send(200, "text/plain", "Password saved. It will be used next time the AP is enabled.");
+    }
+}
+
+void handleFirmwareUpdateFinished() {
+    if (!validWriteToken()) {
+        server.send(403, "text/plain", "Invalid write token");
+        return;
+    }
+
+    bool success = !Update.hasError();
+    server.sendHeader("Connection", "close");
+    server.send(
+        success ? 200 : 500,
+        "text/plain",
+        success ? "Firmware update complete. Rebooting..." : "Firmware update failed"
+    );
+
+    if (success) {
+        delay(400);
+        ESP.restart();
+    }
+}
+
+void handleFirmwareUpload() {
+    if (!validWriteToken()) {
+        return;
+    }
+
+    HTTPUpload& upload = server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        Serial.printf("OTA upload: %s\n", upload.filename.c_str());
+        setOperatingMode(OperatingMode::STANDBY);
+        forceOutputOff();
+
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+            Update.printError(Serial);
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+            Update.printError(Serial);
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (!Update.end(true)) {
+            Update.printError(Serial);
+        } else {
+            Serial.printf("OTA complete: %u bytes\n", upload.totalSize);
+        }
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        Update.end();
+        Serial.println("OTA upload aborted");
+    }
+}
+
+void handleFirmwareRollback() {
+    if (!requireWriteToken()) return;
+
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    const esp_partition_t* alternate = esp_ota_get_next_update_partition(running);
+    if (alternate == nullptr || alternate == running) {
+        server.send(409, "text/plain", "No alternate OTA partition is available");
+        return;
+    }
+
+    esp_app_desc_t description;
+    if (esp_ota_get_partition_description(alternate, &description) != ESP_OK) {
+        server.send(409, "text/plain", "No valid previous firmware image is available");
+        return;
+    }
+
+    if (esp_ota_set_boot_partition(alternate) != ESP_OK) {
+        server.send(500, "text/plain", "Unable to select the previous firmware image");
+        return;
+    }
+
+    setOperatingMode(OperatingMode::STANDBY);
+    forceOutputOff();
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", String("Returning to firmware ") + description.version + ". Rebooting...");
+    delay(400);
+    ESP.restart();
+}
+
+// =====================================================
+// NETWORK
+// =====================================================
+
+void registerWebRoutes() {
+    if (webRoutesRegistered) {
+        return;
+    }
+
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/settings", HTTP_GET, handleSettingsPage);
+    server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/settings", HTTP_POST, handleSettings);
+    server.on("/api/mode", HTTP_POST, handleMode);
+    server.on("/api/calibrate", HTTP_POST, handleCalibration);
+    server.on("/api/output", HTTP_POST, handleManualOutput);
+    server.on("/api/peak/reset", HTTP_POST, handlePeakReset);
+    server.on("/api/wifi", HTTP_POST, handleWiFiPassword);
+    server.on("/api/update", HTTP_POST, handleFirmwareUpdateFinished, handleFirmwareUpload);
+    server.on("/api/rollback", HTTP_POST, handleFirmwareRollback);
+
+    // Common captive-portal probes must redirect to our actual local origin.
+    // Serving dashboard HTML at a Microsoft probe URL can cause Windows to
+    // continue into its MSN fallback rather than remain on the controller.
+    server.on("/generate_204", HTTP_GET, handleCaptivePortalRedirect);
+    server.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortalRedirect);
+    server.on("/library/test/success.html", HTTP_GET, handleCaptivePortalRedirect);
+    server.on("/connecttest.txt", HTTP_GET, handleCaptivePortalRedirect);
+    server.on("/ncsi.txt", HTTP_GET, handleCaptivePortalRedirect);
+    server.on("/redirect", HTTP_GET, handleCaptivePortalRedirect);
+    server.on("/fwlink", HTTP_GET, handleCaptivePortalRedirect);
+
+    server.onNotFound([]() {
+        server.sendHeader("Location", "http://192.168.4.1/", true);
+        server.send(302, "text/plain", "");
+    });
+
+    webRoutesRegistered = true;
+}
+
+void startAccessPoint() {
+    if (accessPointEnabled) {
+        return;
+    }
+
+    Serial.println("Starting Wi-Fi AP...");
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
+    WiFi.softAPsetHostname(MDNS_HOSTNAME);
+
+    wifiHealthy = WiFi.softAP(wifiApSsid.c_str(), wifiApPassword.c_str());
+
+    if (!wifiHealthy) {
+        accessPointEnabled = false;
+        Serial.println("ERROR: Wi-Fi AP failed");
+        displayDirty = true;
+        return;
+    }
+
+    accessPointEnabled = true;
+    delay(100);
+
+    // Captive DNS resolves ordinary hostnames to the controller even on
+    // clients that do not cooperate with .local/mDNS.
+    dnsHealthy = dnsServer.start(DNS_PORT, "*", AP_IP);
+
+    // mDNS remains the preferred friendly wheelie.local name. Give the AP
+    // interface a moment and retry startup because some ESP32-S3/core
+    // combinations are timing-sensitive immediately after softAP().
+    mdnsHealthy = false;
+    for (uint8_t attempt = 0; attempt < 3 && !mdnsHealthy; ++attempt) {
+        mdnsHealthy = MDNS.begin(MDNS_HOSTNAME);
+        if (!mdnsHealthy) delay(120);
+    }
+    if (mdnsHealthy) {
+        MDNS.addService("http", "tcp", 80);
+    }
+
+    server.begin();
+
+    Serial.printf("SSID: %s\n", wifiApSsid.c_str());
+    Serial.printf("IP: %s\n", WiFi.softAPIP().toString().c_str());
+    Serial.printf("mDNS: %s\n", mdnsHealthy ? "http://wheelie.local" : "unavailable");
+    Serial.printf("Captive DNS: %s\n", dnsHealthy ? "ON" : "FAILED");
+    Serial.println("HTTP server started");
+
+    displayDirty = true;
+}
+
+void stopAccessPoint() {
+    if (!accessPointEnabled) {
+        return;
+    }
+
+    // Stop accepting HTTP/DNS clients before dropping the AP.
+    server.stop();
+    dnsServer.stop();
+    dnsHealthy = false;
+
+    if (mdnsHealthy) {
+        MDNS.end();
+    }
+
+    mdnsHealthy = false;
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    wifiHealthy = false;
+    accessPointEnabled = false;
+
+    Serial.println("Wi-Fi AP -> OFF");
+    displayDirty = true;
+}
+
+void scheduleAccessPointRestart(unsigned long delayMs) {
+    accessPointRestartPending = true;
+    accessPointRestartAtMs = millis() + delayMs;
+}
+
+void updateAccessPointRestart() {
+    if (!accessPointRestartPending) return;
+    if ((long)(millis() - accessPointRestartAtMs) < 0) return;
+
+    accessPointRestartPending = false;
+    stopAccessPoint();
+    delay(75);
+    startAccessPoint();
+}
+
+void toggleAccessPointFromButton() {
+    if (accessPointEnabled) {
+        stopAccessPoint();
+    } else {
+        startAccessPoint();
+        Serial.println(accessPointEnabled ? "Wi-Fi AP -> ON" : "Wi-Fi AP failed to start");
+    }
+
+    oled.clearDisplay();
+    displayDirty = true;
+}
+
+void initializeNetwork() {
+    registerWebRoutes();
+    startAccessPoint();
+}
+
+// =====================================================
+// IMU HEALTH / MAIN SENSOR UPDATE
+// =====================================================
+
+bool updateIMUAndPitch(float& dt) {
+    MPUData data;
+
+    if (!readMPU(data)) {
+        imuFailureCount++;
+        imuRecoveryCount = 0;
+
+        if (imuFailureCount >= IMU_FAILURE_LIMIT) {
+            if (imuHealthy) {
+                Serial.println("ERROR: MPU6050 communication lost");
+            }
+            imuHealthy = false;
+            controllerState = ControllerState::NORMAL;
+            forceOutputOff();
+            displayDirty = true;
+        }
+        return false;
+    }
+
+    imuFailureCount = 0;
+
+    if (!imuHealthy) {
+        imuRecoveryCount++;
+        if (imuRecoveryCount >= IMU_RECOVERY_LIMIT) {
+            imuHealthy = true;
+            imuRecoveryCount = IMU_RECOVERY_LIMIT;
+            Serial.println("MPU6050 communication restored");
+            displayDirty = true;
+        }
+    } else {
+        imuRecoveryCount = IMU_RECOVERY_LIMIT;
+    }
+
+    unsigned long nowMicros = micros();
+    dt = (nowMicros - lastMicros) / 1000000.0f;
+    lastMicros = nowMicros;
+
+    if (dt <= 0.0f || dt > 0.1f) {
+        dt = 0.01f;
+    }
+
+    // Normalize the accelerometer so the calibrated stationary magnitude
+    // is 1.00 g even if this particular MPU clone read ~1.12 g at rest.
+    currentAccelX = data.ax * accelScaleCorrection;
+    currentAccelY = data.ay * accelScaleCorrection;
+    currentAccelZ = data.az * accelScaleCorrection;
+
+    // Slowly estimate the gravity vector in sensor coordinates. This tracks
+    // ordinary changes in road/bike attitude, while a launch or impact moves
+    // much faster than the estimator and therefore remains in the residual.
+    float gravityAlpha = dt / (GRAVITY_TRACK_TIME_SEC + dt);
+    gravityAlpha = constrain(gravityAlpha, 0.0f, 1.0f);
+    gravityEstimateX += (currentAccelX - gravityEstimateX) * gravityAlpha;
+    gravityEstimateY += (currentAccelY - gravityEstimateY) * gravityAlpha;
+    gravityEstimateZ += (currentAccelZ - gravityEstimateZ) * gravityAlpha;
+
+    float linearX = currentAccelX - gravityEstimateX;
+    float linearY = currentAccelY - gravityEstimateY;
+    float linearZ = currentAccelZ - gravityEstimateZ;
+    float instantaneousLinearG = sqrtf(
+        linearX * linearX +
+        linearY * linearY +
+        linearZ * linearZ
+    );
+
+    float gAlpha = dt / (GLOAD_SMOOTHING_TIME_SEC + dt);
+    gAlpha = constrain(gAlpha, 0.0f, 1.0f);
+    currentGLoad += (instantaneousLinearG - currentGLoad) * gAlpha;
+    if (currentGLoad < GLOAD_DEADBAND_G) currentGLoad = 0.0f;
+
+    float accelPitch = calculateAccelPitch(data);
+    float gyroRate = getSelectedGyroRate(data) - gyroAxisBias;
+
+    currentGyroRate = PITCH_SIGN * gyroRate;
+
+    pitch =
+        FILTER_ALPHA * (pitch + gyroRate * dt) +
+        (1.0f - FILTER_ALPHA) * accelPitch;
+
+    currentAbsolutePitch = PITCH_SIGN * (pitch - pitchZero);
+
+    if (currentGLoad > highestGLoad) highestGLoad = currentGLoad;
+    return true;
+}
+
+// =====================================================
+// SERIAL STATUS
+// =====================================================
+
+void updateSerialStatus() {
+    unsigned long now = millis();
+    if ((now - lastSerialUpdate) < 250) return;
+    lastSerialUpdate = now;
+
+    Serial.print("Raw:");
+    Serial.print(currentAbsolutePitch, 1);
+    Serial.print(" Base:");
+    Serial.print(adaptiveBaseline, 1);
+    Serial.print(" Trigger:");
+    Serial.print(currentTriggerPitch, 1);
+    Serial.print(" Gyro:");
+    Serial.print(currentGyroRate, 1);
+    Serial.print(" +G:");
+    Serial.print(currentGLoad, 2);
+    Serial.print(" Mode:");
+    Serial.print(getAngleModeName());
+    Serial.print(" ");
+    Serial.print(getModeName());
+    Serial.print(" State:");
+    Serial.print(getStateName());
+    Serial.print(" PWM:");
+    Serial.print(outputBrightness);
+    Serial.print(" AP:");
+    Serial.print(accessPointEnabled ? "ON" : "OFF");
+    Serial.print(" Clients:");
+    Serial.println(accessPointEnabled ? WiFi.softAPgetStationNum() : 0);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    Serial.println();
+    Serial.println("Motorcycle Wheelie Controller");
+    Serial.print("Firmware ");
+    Serial.println(FIRMWARE_VERSION);
+    Serial.println("Dynamic +G + Peaks + Wi-Fi Recovery + Robust Discovery");
+    Serial.println("--------------------------------");
+
+    // Hardware-safe output state before anything else.
+    pinMode(OUTPUT1_PWM_PIN, OUTPUT);
+    digitalWrite(OUTPUT1_PWM_PIN, LOW);
+
+    pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
+
+    loadSettings();
+    writeToken = makeWriteToken();
+
+    // OLED initializes the shared I2C bus. Do not add Wire.begin().
+    oled.begin();
+    oled.setPowerSave(0);
+    oled.setFlipMode(1);
+    oled.setFont(u8x8_font_chroma48medium8_r);
+    oled.clearDisplay();
+    Wire.setClock(400000);
+
+    drawBootScreen();
+    delay(600);
+
+    initializePWM();
+
+    // MPU6050 configuration.
+    writeMPURegister(PWR_MGMT_1, 0x00);
+    delay(100);
+    writeMPURegister(CONFIG_REG, 0x03);   // ~44/42 Hz internal DLPF
+    writeMPURegister(ACCEL_CONFIG, ACCEL_RANGE_CONFIG_VALUE); // +/-4g
+    writeMPURegister(GYRO_CONFIG, 0x00);  // ±250 deg/s
+
+    Serial.printf("Initial calibration begins in %u seconds; level the bike now.\n",
+                  INITIAL_CALIBRATION_DELAY_SECONDS);
+    for (uint8_t seconds = INITIAL_CALIBRATION_DELAY_SECONDS; seconds > 0; --seconds) {
+        char countdown[17];
+        snprintf(countdown, sizeof(countdown), "Starting in %u...", seconds);
+        drawCalibrationScreen(countdown);
+        delay(1000);
+    }
+
+    bool calibrated = calibrateMPU();
+    lastMicros = micros();
+
+    // A failed calibration always leaves the controller safe.
+    if (calibrated && settings.bootArmed) {
+        operatingMode = OperatingMode::ARMED;
+        resetAdaptiveBaselineToCurrent();
+    } else {
+        operatingMode = OperatingMode::STANDBY;
+        forceOutputOff();
+    }
+
+    initializeNetwork();
+
+    oled.clearDisplay();
+    displayDirty = true;
+
+    Serial.println();
+    Serial.println("CONTROLLER READY");
+    Serial.printf("Angle mode: %s\n", getAngleModeName());
+    Serial.printf("Boot mode: %s\n", getModeName());
+    Serial.printf("Wi-Fi: %s\n", wifiApSsid.c_str());
+    Serial.println("Try: http://wheelie.local");
+    Serial.println("Fallback: http://192.168.4.1");
+    Serial.println("Button: 1x page, 2x angle mode, 3x Wi-Fi AP, hold ARM/STANDBY, 30s reset Wi-Fi password");
+    // If rollback support is enabled in the bootloader, reaching the end of
+    // setup confirms that the newly selected OTA image initialized safely.
+    esp_ota_mark_app_valid_cancel_rollback();
+    Serial.println();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+    if (accessPointEnabled) {
+        dnsServer.processNextRequest();
+        server.handleClient();
+    }
+    updateAccessPointRestart();
+    updateButton();
+    updateManualOutputTest();
+    updateOutputFade();
+
+    float dt = 0.01f;
+    bool gotSensorSample = updateIMUAndPitch(dt);
+
+    if (gotSensorSample) {
+        updateAngleProcessing(dt);
+        updateController(currentTriggerPitch);
+    } else if (!imuHealthy) {
+        controllerState = ControllerState::NORMAL;
+        forceOutputOff();
+    }
+
+    updateDisplay();
+    updateSerialStatus();
+
+    delay(3);
+}
