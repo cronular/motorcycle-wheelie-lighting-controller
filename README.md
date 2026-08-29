@@ -52,6 +52,8 @@ pio run -e seeed_xiao_esp32s3 -t upload --upload-port COM13
 ```
 
 Change `COM13` to the board's current serial port.
+The project pins pioarduino `55.03.311` so local and GitHub release builds use
+Arduino-ESP32 3.3.11 and ESP-IDF 5.5.5 consistently.
 
 ## Test without hardware
 

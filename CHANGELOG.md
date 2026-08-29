@@ -17,6 +17,7 @@ Changes under active evaluation on the `testing` branch.
 - Interactive desktop component simulator and repeatable riding scenarios.
 - Native device-free regression suite covering production controller logic.
 - Automated CI builds and tagged firmware release packaging.
+- Reproducible release builds pinned to Arduino-ESP32 3.3.11 / ESP-IDF 5.5.5.
 
 ### Safety
 
