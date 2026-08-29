@@ -83,8 +83,8 @@ The current `main` version is also hosted as a
 - `main` is the current releasable firmware.
 - `testing` is the integration branch for firmware and simulator changes.
 - Pull requests flow from `testing` into `main` after CI passes.
-- Version tags such as `v0.11` publish verified `firmware.bin`,
-  `firmware.factory.bin`, and SHA-256 checksums.
+- Version tags publish a verified OTA `firmware.bin`, SHA-256 checksums, and a
+  combined factory image when the selected PlatformIO release produces one.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete workflow and
 [CHANGELOG.md](CHANGELOG.md) for release history.

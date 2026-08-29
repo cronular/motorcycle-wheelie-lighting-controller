@@ -13,7 +13,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -29,7 +29,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
           Copy-Item .pio/build/seeed_xiao_esp32s3/firmware.bin release/wheelie-controller-${{ github.ref_name }}.bin
-          Copy-Item .pio/build/seeed_xiao_esp32s3/firmware.factory.bin release/wheelie-controller-${{ github.ref_name }}-factory.bin
+          $factory = '.pio/build/seeed_xiao_esp32s3/firmware.factory.bin'
+          if (Test-Path -LiteralPath $factory) {
+            Copy-Item -LiteralPath $factory release/wheelie-controller-${{ github.ref_name }}-factory.bin
+          }
           Get-ChildItem release/*.bin | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Add-Content release/SHA256SUMS.txt
