@@ -7,6 +7,13 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+### Added
+
+- First-run OLED mounting wizard that detects upright, roll, and pitch axes from
+  a stationary pose followed by gentle side-to-side leaning.
+- Persistent orientation storage in device NVS plus a settings-page rerun flow.
+- Live roll/lean angle and roll-rate telemetry for future lean displays.
+
 ## [0.11.0] - 2026-08-29
 
 ### Added

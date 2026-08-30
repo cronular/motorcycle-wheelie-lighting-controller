@@ -7,7 +7,7 @@
 [![Firmware CI](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/cronular/motorcycle-wheelie-lighting-controller?display_name=tag)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/releases/latest)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-XIAO_ESP32--S3-orange)](https://platformio.org/)
-[![Tests](https://img.shields.io/badge/native_tests-14-brightgreen)](#test-without-hardware)
+[![Tests](https://img.shields.io/badge/native_tests-21-brightgreen)](#test-without-hardware)
 [![Live simulator](https://img.shields.io/badge/try-live_simulator-48e0d0)](https://cronular.github.io/motorcycle-wheelie-lighting-controller/)
 
 </div>
@@ -27,6 +27,7 @@ dashboard.
 - Configurable trigger hold, minimum-on time, brightness, fades, and patterns.
 - High-angle and pitch-rate warning behavior with safe IMU-failure shutdown.
 - SSD1306 status pages and physical-button gesture controls.
+- First-run mounting wizard with persistent pitch/roll axis detection.
 - Local Wi-Fi dashboard, captive portal, OTA update, and rollback support.
 - Desktop simulator and native regression tests—no connected board required.
 - Automated GitHub builds with downloadable firmware artifacts and releases.
@@ -64,7 +65,7 @@ pio test -e native
 PlatformIO provisions the project-local Windows compiler automatically. The
 suite executes the same portable helpers used by the firmware and covers state
 transitions, timing, hysteresis, rollover, adaptive tracking, warnings, patterns,
-fades, validation, and complete wheelie profiles.
+fades, mounting-axis detection, validation, and complete wheelie profiles.
 
 ## Interactive simulator
 

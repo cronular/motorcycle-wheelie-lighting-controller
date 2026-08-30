@@ -178,6 +178,57 @@ void test_full_wheelie_profile() {
     TEST_ASSERT_EQUAL_INT((int)ControllerState::NORMAL, (int)state);
 }
 
+void test_orientation_detects_z_vertical_x_roll_y_pitch() {
+    const OrientationResult result = detectOrientationAxes(
+        0.03f, -0.02f, 1.01f, 12.0f, 1.5f, 0.8f);
+    TEST_ASSERT_TRUE(result.valid);
+    TEST_ASSERT_EQUAL_INT((int)RotationAxis::Z, (int)result.verticalAxis);
+    TEST_ASSERT_EQUAL_INT((int)RotationAxis::X, (int)result.rollAxis);
+    TEST_ASSERT_EQUAL_INT((int)RotationAxis::Y, (int)result.pitchAxis);
+}
+
+void test_orientation_detects_y_vertical_z_roll_x_pitch() {
+    const OrientationResult result = detectOrientationAxes(
+        0.04f, -0.98f, 0.08f, 2.0f, 0.6f, 9.0f);
+    TEST_ASSERT_TRUE(result.valid);
+    TEST_ASSERT_EQUAL_INT((int)RotationAxis::Y, (int)result.verticalAxis);
+    TEST_ASSERT_EQUAL_INT((int)RotationAxis::Z, (int)result.rollAxis);
+    TEST_ASSERT_EQUAL_INT((int)RotationAxis::X, (int)result.pitchAxis);
+}
+
+void test_orientation_rejects_insufficient_lean_motion() {
+    const OrientationResult result = detectOrientationAxes(
+        0.0f, 0.0f, 1.0f, 1.5f, 0.4f, 0.2f);
+    TEST_ASSERT_FALSE(result.valid);
+}
+
+void test_orientation_rejects_ambiguous_motion() {
+    const OrientationResult result = detectOrientationAxes(
+        0.0f, 1.0f, 0.0f, 6.0f, 0.2f, 5.5f);
+    TEST_ASSERT_FALSE(result.valid);
+}
+
+void test_relative_rotation_around_x_is_signed() {
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 30.0f, calculateRelativeRotationDegrees(
+        RotationAxis::X, 0.0f, 0.0f, 1.0f, 0.0f, 0.5f, 0.8660254f));
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, -30.0f, calculateRelativeRotationDegrees(
+        RotationAxis::X, 0.0f, 0.0f, 1.0f, 0.0f, -0.5f, 0.8660254f));
+}
+
+void test_relative_rotation_around_y_is_signed() {
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 30.0f, calculateRelativeRotationDegrees(
+        RotationAxis::Y, 0.0f, 0.0f, 1.0f, -0.5f, 0.0f, 0.8660254f));
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, -30.0f, calculateRelativeRotationDegrees(
+        RotationAxis::Y, 0.0f, 0.0f, 1.0f, 0.5f, 0.0f, 0.8660254f));
+}
+
+void test_relative_rotation_handles_y_vertical_z_roll() {
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, 30.0f, calculateRelativeRotationDegrees(
+        RotationAxis::Z, 0.0f, 1.0f, 0.0f, 0.5f, 0.8660254f, 0.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.05f, -30.0f, calculateRelativeRotationDegrees(
+        RotationAxis::Z, 0.0f, 1.0f, 0.0f, -0.5f, 0.8660254f, 0.0f));
+}
+
 static void runAllTests() {
     RUN_TEST(test_trigger_hold);
     RUN_TEST(test_pending_cancellation);
@@ -193,6 +244,13 @@ static void runAllTests() {
     RUN_TEST(test_light_patterns);
     RUN_TEST(test_fade_interpolation);
     RUN_TEST(test_full_wheelie_profile);
+    RUN_TEST(test_orientation_detects_z_vertical_x_roll_y_pitch);
+    RUN_TEST(test_orientation_detects_y_vertical_z_roll_x_pitch);
+    RUN_TEST(test_orientation_rejects_insufficient_lean_motion);
+    RUN_TEST(test_orientation_rejects_ambiguous_motion);
+    RUN_TEST(test_relative_rotation_around_x_is_signed);
+    RUN_TEST(test_relative_rotation_around_y_is_signed);
+    RUN_TEST(test_relative_rotation_handles_y_vertical_z_roll);
 }
 
 #ifdef ARDUINO
