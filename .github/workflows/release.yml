@@ -1,9 +1,8 @@
-name: Publish firmware release
+name: Publish signed firmware release
 
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,32 +10,66 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install PlatformIO
-        run: python -m pip install --disable-pip-version-check platformio
-      - name: Test and build
-        run: |
-          pio test -e native
-          python tools/run_simulator.py --check
-          pio run -e seeed_xiao_esp32s3
-      - name: Package binaries and checksums
+      - name: Require a stable tag from main
         shell: pwsh
         run: |
+          git fetch origin main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Stable release tags must point to a commit on main' }
+          $versionMatch = Select-String -Path src/main.cpp -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
+          $firmwareVersion = $versionMatch.Matches[0].Groups[1].Value
+          if ($firmwareVersion -ne '${{ github.ref_name }}') {
+            throw "Tag ${{ github.ref_name }} does not match embedded firmware version $firmwareVersion"
+          }
+      - name: Install build and signing tools
+        run: python -m pip install --disable-pip-version-check platformio cryptography
+      - name: Test and build stable firmware
+        shell: pwsh
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          RELEASE_CHANNEL: stable
+        run: |
+          $env:BUILD_DATE = (git show -s --format=%cI HEAD)
+          pio test -e native
+          python -m unittest test/test_package_firmware.py
+          python tools/check_embedded_web.py
+          python tools/run_simulator.py --check
+          pio run -e seeed_xiao_esp32s3
+      - name: Sign and package release
+        shell: pwsh
+        env:
+          FIRMWARE_SIGNING_KEY_PEM: ${{ secrets.FIRMWARE_SIGNING_KEY_PEM }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:FIRMWARE_SIGNING_KEY_PEM)) {
+            throw 'FIRMWARE_SIGNING_KEY_PEM is required; unsigned releases are prohibited'
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'firmware-signing-private.pem'
+          [IO.File]::WriteAllText($keyPath, $env:FIRMWARE_SIGNING_KEY_PEM)
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item .pio/build/seeed_xiao_esp32s3/firmware.bin release/wheelie-controller-${{ github.ref_name }}.bin
+          $built = (git show -s --format=%cI HEAD)
+          $package = "release/wheelie-controller-${{ github.ref_name }}.wctrl"
+          python tools/package_firmware.py package --firmware .pio/build/seeed_xiao_esp32s3/firmware.bin --private-key $keyPath --output $package --version '${{ github.ref_name }}' --channel stable --commit '${{ github.sha }}' --built $built
+          python tools/package_firmware.py verify --package $package --public-key security/firmware-signing-public.pem
           $factory = '.pio/build/seeed_xiao_esp32s3/firmware.factory.bin'
           if (Test-Path -LiteralPath $factory) {
-            Copy-Item -LiteralPath $factory release/wheelie-controller-${{ github.ref_name }}-factory.bin
+            Copy-Item -LiteralPath $factory "release/wheelie-controller-${{ github.ref_name }}-factory.bin"
           }
-          Get-ChildItem release/*.bin | ForEach-Object {
+          Copy-Item security/firmware-signing-public.pem release/firmware-signing-public.pem
+          Get-ChildItem release | Where-Object Name -NotLike 'SHA256SUMS*' | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($_.Name)" | Add-Content release/SHA256SUMS.txt
           }
+          python tools/package_firmware.py sign-file --file release/SHA256SUMS.txt --private-key $keyPath --output release/SHA256SUMS.txt.sig
+          python tools/package_firmware.py verify-file --file release/SHA256SUMS.txt --signature release/SHA256SUMS.txt.sig --public-key security/firmware-signing-public.pem
+          Remove-Item -LiteralPath $keyPath -Force
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:

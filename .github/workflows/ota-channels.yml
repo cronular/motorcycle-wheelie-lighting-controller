@@ -1,0 +1,84 @@
+name: Publish OTA channel
+
+on:
+  push:
+    branches: [main, testing]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ota-channel-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install build and signing tools
+        run: python -m pip install --disable-pip-version-check platformio cryptography
+      - name: Test and build channel firmware
+        shell: pwsh
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          $env:BUILD_DATE = (git show -s --format=%cI HEAD)
+          $env:RELEASE_CHANNEL = if ('${{ github.ref_name }}' -eq 'main') { 'stable' } else { 'testing' }
+          pio test -e native
+          python -m unittest test/test_package_firmware.py
+          python tools/check_embedded_web.py
+          python tools/run_simulator.py --check
+          pio run -e seeed_xiao_esp32s3
+      - name: Sign channel package
+        id: package
+        shell: pwsh
+        env:
+          FIRMWARE_SIGNING_KEY_PEM: ${{ secrets.FIRMWARE_SIGNING_KEY_PEM }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:FIRMWARE_SIGNING_KEY_PEM)) {
+            throw 'FIRMWARE_SIGNING_KEY_PEM is required; unsigned channel builds are prohibited'
+          }
+          $channel = if ('${{ github.ref_name }}' -eq 'main') { 'stable' } else { 'testing' }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'firmware-signing-private.pem'
+          [IO.File]::WriteAllText($keyPath, $env:FIRMWARE_SIGNING_KEY_PEM)
+          New-Item -ItemType Directory -Force channel | Out-Null
+          $versionMatch = Select-String -Path src/main.cpp -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
+          $version = $versionMatch.Matches[0].Groups[1].Value
+          $built = (git show -s --format=%cI HEAD)
+          $package = "channel/wheelie-controller-$channel.wctrl"
+          python tools/package_firmware.py package --firmware .pio/build/seeed_xiao_esp32s3/firmware.bin --private-key $keyPath --output $package --version $version --channel $channel --commit '${{ github.sha }}' --built $built
+          python tools/package_firmware.py verify --package $package --public-key security/firmware-signing-public.pem
+          Copy-Item security/firmware-signing-public.pem channel/firmware-signing-public.pem
+          Get-ChildItem channel | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)" | Add-Content channel/SHA256SUMS.txt
+          }
+          python tools/package_firmware.py sign-file --file channel/SHA256SUMS.txt --private-key $keyPath --output channel/SHA256SUMS.txt.sig
+          python tools/package_firmware.py verify-file --file channel/SHA256SUMS.txt --signature channel/SHA256SUMS.txt.sig --public-key security/firmware-signing-public.pem
+          Remove-Item -LiteralPath $keyPath -Force
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+      - name: Move rolling channel tag
+        shell: pwsh
+        run: |
+          $tag = "ota-${{ steps.package.outputs.channel }}"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git tag -f $tag $env:GITHUB_SHA
+          git push origin "refs/tags/$tag" --force
+      - name: Publish rolling channel release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ota-${{ steps.package.outputs.channel }}
+          name: ${{ steps.package.outputs.channel == 'stable' && 'Stable OTA channel' || 'Testing OTA channel' }}
+          prerelease: ${{ steps.package.outputs.channel == 'testing' }}
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: channel/*

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 enum class AngleMode : uint8_t { ABSOLUTE = 0, ADAPTIVE = 1 };
 enum class LightPattern : uint8_t { OFF = 0, SOLID = 1, SLOW_PULSE = 2, FAST_PULSE = 3, STROBE = 4 };
@@ -37,11 +39,113 @@ struct ControllerSettings {
 
 enum class ControllerState : uint8_t { NORMAL, TRIGGER_PENDING, WHEELIE };
 
+constexpr uint16_t FIRMWARE_PACKAGE_HEADER_SIZE = 16;
+constexpr uint8_t FIRMWARE_PACKAGE_MAGIC[8] = {'W', 'C', 'T', 'R', 'L', '1', '\r', '\n'};
+constexpr uint16_t FIRMWARE_MANIFEST_MAX_SIZE = 768;
+constexpr uint16_t FIRMWARE_SIGNATURE_MAX_SIZE = 80;
+
+struct WriteRateLimitBucket {
+    uint32_t clientKey = 0;
+    uint32_t windowStartedMs = 0;
+    uint32_t blockedUntilMs = 0;
+    uint32_t lastSeenMs = 0;
+    uint8_t requestCount = 0;
+    bool occupied = false;
+};
+
+enum class WriteRateLimitDecision : uint8_t { ALLOW, BLOCK };
+
 // Hardware-independent helpers live here so the ESP32 firmware and desktop
 // regression suite exercise the same behavior. Keep this header free of
 // Arduino/ESP32 dependencies.
 inline float controllerClamp(float value, float low, float high) {
     return value < low ? low : (value > high ? high : value);
+}
+
+inline uint16_t readLittleEndian16(const uint8_t* data) {
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+inline uint32_t readLittleEndian32(const uint8_t* data) {
+    return (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
+
+inline bool hasFirmwarePackageMagic(const uint8_t* data, size_t size) {
+    if (size < sizeof(FIRMWARE_PACKAGE_MAGIC)) return false;
+    uint8_t difference = 0;
+    for (size_t index = 0; index < sizeof(FIRMWARE_PACKAGE_MAGIC); ++index) {
+        difference |= data[index] ^ FIRMWARE_PACKAGE_MAGIC[index];
+    }
+    return difference == 0;
+}
+
+inline bool isFirmwareMetadataCompatible(
+    const char* packageBoard,
+    const char* packageChannel,
+    const char* expectedBoard,
+    const char* selectedChannel
+) {
+    if (packageBoard == nullptr || packageChannel == nullptr ||
+        expectedBoard == nullptr || selectedChannel == nullptr) return false;
+    return strcmp(packageBoard, expectedBoard) == 0 &&
+        strcmp(packageChannel, selectedChannel) == 0;
+}
+
+inline WriteRateLimitDecision checkWriteRateLimit(
+    WriteRateLimitBucket* buckets,
+    size_t bucketCount,
+    uint32_t clientKey,
+    uint32_t nowMs,
+    uint8_t maximumRequests = 12,
+    uint32_t windowMs = 10000,
+    uint32_t blockMs = 30000
+) {
+    if (buckets == nullptr || bucketCount == 0) return WriteRateLimitDecision::BLOCK;
+
+    size_t selected = bucketCount;
+    size_t oldest = 0;
+    for (size_t index = 0; index < bucketCount; ++index) {
+        if (buckets[index].occupied && buckets[index].clientKey == clientKey) {
+            selected = index;
+            break;
+        }
+        if (!buckets[index].occupied) {
+            selected = index;
+            break;
+        }
+        if ((uint32_t)(nowMs - buckets[index].lastSeenMs) >
+            (uint32_t)(nowMs - buckets[oldest].lastSeenMs)) oldest = index;
+    }
+    if (selected == bucketCount) selected = oldest;
+
+    WriteRateLimitBucket& bucket = buckets[selected];
+    if (!bucket.occupied || bucket.clientKey != clientKey) {
+        bucket = WriteRateLimitBucket{};
+        bucket.occupied = true;
+        bucket.clientKey = clientKey;
+        bucket.windowStartedMs = nowMs;
+    }
+    bucket.lastSeenMs = nowMs;
+
+    if (bucket.blockedUntilMs != 0 &&
+        (int32_t)(bucket.blockedUntilMs - nowMs) > 0) {
+        return WriteRateLimitDecision::BLOCK;
+    }
+    bucket.blockedUntilMs = 0;
+
+    if ((uint32_t)(nowMs - bucket.windowStartedMs) >= windowMs) {
+        bucket.windowStartedMs = nowMs;
+        bucket.requestCount = 0;
+    }
+    if (bucket.requestCount >= maximumRequests) {
+        bucket.blockedUntilMs = nowMs + blockMs;
+        return WriteRateLimitDecision::BLOCK;
+    }
+    bucket.requestCount++;
+    return WriteRateLimitDecision::ALLOW;
 }
 
 inline bool isRotationAxisValid(RotationAxis axis) {

@@ -229,6 +229,67 @@ void test_relative_rotation_handles_y_vertical_z_roll() {
         RotationAxis::Z, 0.0f, 1.0f, 0.0f, -0.5f, 0.8660254f, 0.0f));
 }
 
+void test_firmware_package_header_helpers() {
+    uint8_t header[FIRMWARE_PACKAGE_HEADER_SIZE] = {
+        'W', 'C', 'T', 'R', 'L', '1', '\r', '\n',
+        0x34, 0x12, 0x48, 0x00, 0x78, 0x56, 0x34, 0x12
+    };
+    TEST_ASSERT_TRUE(hasFirmwarePackageMagic(header, sizeof(header)));
+    TEST_ASSERT_EQUAL_UINT16(0x1234, readLittleEndian16(header + 8));
+    TEST_ASSERT_EQUAL_UINT16(0x0048, readLittleEndian16(header + 10));
+    TEST_ASSERT_EQUAL_UINT32(0x12345678, readLittleEndian32(header + 12));
+    header[0] = 'X';
+    TEST_ASSERT_FALSE(hasFirmwarePackageMagic(header, sizeof(header)));
+}
+
+void test_firmware_metadata_requires_board_and_channel() {
+    TEST_ASSERT_TRUE(isFirmwareMetadataCompatible(
+        "seeed_xiao_esp32s3", "testing", "seeed_xiao_esp32s3", "testing"));
+    TEST_ASSERT_FALSE(isFirmwareMetadataCompatible(
+        "esp32dev", "testing", "seeed_xiao_esp32s3", "testing"));
+    TEST_ASSERT_FALSE(isFirmwareMetadataCompatible(
+        "seeed_xiao_esp32s3", "stable", "seeed_xiao_esp32s3", "testing"));
+}
+
+void test_write_rate_limit_blocks_burst() {
+    WriteRateLimitBucket buckets[2];
+    for (uint8_t request = 0; request < 3; ++request) {
+        TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::ALLOW, (int)checkWriteRateLimit(
+            buckets, 2, 0x01020304, 1000 + request, 3, 10000, 30000));
+    }
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::BLOCK, (int)checkWriteRateLimit(
+        buckets, 2, 0x01020304, 1004, 3, 10000, 30000));
+}
+
+void test_write_rate_limit_is_per_client() {
+    WriteRateLimitBucket buckets[2];
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::ALLOW, (int)checkWriteRateLimit(
+        buckets, 2, 1, 1000, 1, 10000, 30000));
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::BLOCK, (int)checkWriteRateLimit(
+        buckets, 2, 1, 1001, 1, 10000, 30000));
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::ALLOW, (int)checkWriteRateLimit(
+        buckets, 2, 2, 1002, 1, 10000, 30000));
+}
+
+void test_write_rate_limit_recovers_after_block() {
+    WriteRateLimitBucket buckets[1];
+    checkWriteRateLimit(buckets, 1, 7, 1000, 1, 10000, 30000);
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::BLOCK, (int)checkWriteRateLimit(
+        buckets, 1, 7, 1001, 1, 10000, 30000));
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::ALLOW, (int)checkWriteRateLimit(
+        buckets, 1, 7, 31002, 1, 10000, 30000));
+}
+
+void test_write_rate_limit_handles_millis_rollover() {
+    WriteRateLimitBucket buckets[1];
+    const uint32_t nearRollover = UINT32_MAX - 100;
+    checkWriteRateLimit(buckets, 1, 9, nearRollover, 1, 10000, 30000);
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::BLOCK, (int)checkWriteRateLimit(
+        buckets, 1, 9, nearRollover + 1, 1, 10000, 30000));
+    TEST_ASSERT_EQUAL_INT((int)WriteRateLimitDecision::ALLOW, (int)checkWriteRateLimit(
+        buckets, 1, 9, nearRollover + 30001, 1, 10000, 30000));
+}
+
 static void runAllTests() {
     RUN_TEST(test_trigger_hold);
     RUN_TEST(test_pending_cancellation);
@@ -251,6 +312,12 @@ static void runAllTests() {
     RUN_TEST(test_relative_rotation_around_x_is_signed);
     RUN_TEST(test_relative_rotation_around_y_is_signed);
     RUN_TEST(test_relative_rotation_handles_y_vertical_z_roll);
+    RUN_TEST(test_firmware_package_header_helpers);
+    RUN_TEST(test_firmware_metadata_requires_board_and_channel);
+    RUN_TEST(test_write_rate_limit_blocks_burst);
+    RUN_TEST(test_write_rate_limit_is_per_client);
+    RUN_TEST(test_write_rate_limit_recovers_after_block);
+    RUN_TEST(test_write_rate_limit_handles_millis_rollover);
 }
 
 #ifdef ARDUINO

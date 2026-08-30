@@ -29,7 +29,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PlatformIO
-        run: python -m pip install --disable-pip-version-check platformio
+        run: python -m pip install --disable-pip-version-check platformio cryptography
 
       - name: Cache PlatformIO packages
         uses: actions/cache@v6
@@ -41,11 +41,24 @@ jobs:
       - name: Run native regression suite
         run: pio test -e native
 
+      - name: Test signed firmware packaging
+        run: python -m unittest test/test_package_firmware.py
+
       - name: Smoke-test desktop simulator
-        run: python tools/run_simulator.py --check
+        run: |
+          python tools/check_embedded_web.py
+          python tools/run_simulator.py --check
 
       - name: Build XIAO ESP32-S3 firmware
-        run: pio run -e seeed_xiao_esp32s3
+        shell: pwsh
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          $env:BUILD_DATE = (git show -s --format=%cI HEAD)
+          $targetBranch = '${{ github.base_ref }}'
+          if ([string]::IsNullOrWhiteSpace($targetBranch)) { $targetBranch = '${{ github.ref_name }}' }
+          $env:RELEASE_CHANNEL = if ($targetBranch -eq 'main') { 'stable' } else { 'testing' }
+          pio run -e seeed_xiao_esp32s3
 
       - name: Stage firmware artifacts
         shell: pwsh
