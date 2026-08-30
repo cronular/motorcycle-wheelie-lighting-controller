@@ -6,6 +6,11 @@
 *.bin
 *.elf
 *.map
+*.wctrl
+*.manifest
+*.sig
+*-private.pem
+firmware-signing-private.*
 __pycache__/
 *.py[cod]
 .DS_Store

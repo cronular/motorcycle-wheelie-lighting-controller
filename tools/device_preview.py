@@ -46,7 +46,7 @@ STATIC_SHIM = r"""
   const base = {angleMode:'adaptive',rotationAxis:'y',adaptiveTau:4,freezeRate:8,
     trigger:25,reset:12,hold:150,minon:1000,brightness:100,fade:200,
     bootArmed:false,warningAngle:42,warningReset:36,warningRate:45,
-    wheeliePattern:1,warningPattern:4,warningBrightness:100};
+    wheeliePattern:1,warningPattern:4,warningBrightness:100,otaChannel:'testing'};
   function status(){
     const elapsed=(performance.now()-started)/1000, phase=elapsed%14;
     let pitch=phase<3?1.5*Math.sin(phase*2):phase<7?(phase-3)/4*49:
@@ -55,12 +55,13 @@ STATIC_SHIM = r"""
     const wheelie=mode==='ARMED'&&pitch>=base.trigger, warning=mode==='ARMED'&&pitch>=base.warningAngle;
     const g=Math.max(0,.08+Math.abs(gyro)/90+.05*Math.sin(elapsed*4));
     peakAngle=Math.max(peakAngle,pitch);peakG=Math.max(peakG,g);
-    return {...base,pitch,rawPitch:pitch+2.4,baseline:2.4,gyroRate:gyro,gLoad:g,
+    return {...base,pitch,rawPitch:pitch+2.4,roll:Math.sin(elapsed)*8,rollRate:Math.cos(elapsed)*8,baseline:2.4,gyroRate:gyro,gLoad:g,
       peakAngle,peakG,warningActive:warning,eventCount:3,activeDuration:wheelie?Math.max(0,phase-5)*1000:0,
       lastDuration:4200,lastPeakAngle:38.6,lastPeakG:.72,accelX:0,accelY:0,accelZ:1,
       baselineFrozen:wheelie,mode,state:wheelie?'WHEELIE':pitch>=base.trigger-2?'PENDING':'NORMAL',
       output:wheelie||warning?100:0,imu:true,apEnabled:true,ssid:'wheelie_controller_4821',
-      mdns:true,dns:true,clients:1,uptime:Math.floor(elapsed),firmware:'preview',calOneGRaw:1,
+      rollAxis:'x',verticalAxis:'z',orientationConfigured:true,mdns:true,dns:true,clients:1,uptime:Math.floor(elapsed),firmware:'preview',
+      board:'seeed_xiao_esp32s3',chip:'esp32s3',buildCommit:'preview123456',buildDate:'2026-08-30T12:00:00Z',releaseChannel:'testing',signedOta:true,calOneGRaw:1,
       calAccelRms:.008,calGyroRms:.24,calHighVibration:false,token:'LOCAL-PREVIEW'};
   }
   window.fetch = async (input, options={}) => {
@@ -115,6 +116,7 @@ state = {
         "wheeliePattern": 1,
         "warningPattern": 4,
         "warningBrightness": 100,
+        "otaChannel": "testing",
     },
 }
 started = time.monotonic()
@@ -152,6 +154,8 @@ def telemetry() -> dict:
     return {
         "pitch": pitch,
         "rawPitch": pitch + 2.4,
+        "roll": math.sin(elapsed) * 8.0,
+        "rollRate": math.cos(elapsed) * 8.0,
         "baseline": 2.4,
         "gyroRate": gyro,
         "gLoad": g_load,
@@ -171,6 +175,9 @@ def telemetry() -> dict:
         "state": controller_state,
         "output": 100 if wheelie or warning else 0,
         "imu": True,
+        "rollAxis": "x",
+        "verticalAxis": "z",
+        "orientationConfigured": True,
         **settings,
         "apEnabled": True,
         "ssid": "wheelie_controller_4821",
@@ -179,6 +186,12 @@ def telemetry() -> dict:
         "clients": 1,
         "uptime": int(elapsed),
         "firmware": "preview",
+        "board": "seeed_xiao_esp32s3",
+        "chip": "esp32s3",
+        "buildCommit": "preview123456",
+        "buildDate": "2026-08-30T12:00:00Z",
+        "releaseChannel": "testing",
+        "signedOta": True,
         "calOneGRaw": 1.0,
         "calAccelRms": 0.008,
         "calGyroRms": 0.24,
