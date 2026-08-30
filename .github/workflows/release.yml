@@ -39,7 +39,7 @@ jobs:
         run: |
           $env:BUILD_DATE = (git show -s --format=%cI HEAD)
           pio test -e native
-          python -m unittest test/test_package_firmware.py
+          python -m unittest discover -s test -p test_package_firmware.py
           python tools/check_embedded_web.py
           python tools/run_simulator.py --check
           pio run -e seeed_xiao_esp32s3

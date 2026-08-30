@@ -42,7 +42,7 @@ jobs:
         run: pio test -e native
 
       - name: Test signed firmware packaging
-        run: python -m unittest test/test_package_firmware.py
+        run: python -m unittest discover -s test -p test_package_firmware.py
 
       - name: Smoke-test desktop simulator
         run: |
