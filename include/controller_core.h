@@ -5,6 +5,16 @@
 
 enum class AngleMode : uint8_t { ABSOLUTE = 0, ADAPTIVE = 1 };
 enum class LightPattern : uint8_t { OFF = 0, SOLID = 1, SLOW_PULSE = 2, FAST_PULSE = 3, STROBE = 4 };
+enum class RotationAxis : uint8_t { X = 0, Y = 1, Z = 2 };
+
+struct OrientationResult {
+    bool valid = false;
+    RotationAxis verticalAxis = RotationAxis::Z;
+    RotationAxis rollAxis = RotationAxis::X;
+    RotationAxis pitchAxis = RotationAxis::Y;
+    float rollMotionDegSec = 0.0f;
+    float confidence = 0.0f;
+};
 
 struct ControllerSettings {
     float triggerAngle = 20.0f;
@@ -32,6 +42,99 @@ enum class ControllerState : uint8_t { NORMAL, TRIGGER_PENDING, WHEELIE };
 // Arduino/ESP32 dependencies.
 inline float controllerClamp(float value, float low, float high) {
     return value < low ? low : (value > high ? high : value);
+}
+
+inline bool isRotationAxisValid(RotationAxis axis) {
+    return axis == RotationAxis::X || axis == RotationAxis::Y || axis == RotationAxis::Z;
+}
+
+inline RotationAxis remainingRotationAxis(RotationAxis first, RotationAxis second) {
+    for (uint8_t value = 0; value < 3; ++value) {
+        const RotationAxis candidate = static_cast<RotationAxis>(value);
+        if (candidate != first && candidate != second) return candidate;
+    }
+    return RotationAxis::Y;
+}
+
+inline float calculateRelativeRotationDegrees(
+    RotationAxis axis,
+    float referenceX,
+    float referenceY,
+    float referenceZ,
+    float currentX,
+    float currentY,
+    float currentZ
+) {
+    float crossAlongAxis = 0.0f;
+    float projectedDot = 0.0f;
+    switch (axis) {
+        case RotationAxis::X:
+            crossAlongAxis = currentY * referenceZ - currentZ * referenceY;
+            projectedDot = currentY * referenceY + currentZ * referenceZ;
+            break;
+        case RotationAxis::Y:
+            crossAlongAxis = currentZ * referenceX - currentX * referenceZ;
+            projectedDot = currentX * referenceX + currentZ * referenceZ;
+            break;
+        case RotationAxis::Z:
+            crossAlongAxis = currentX * referenceY - currentY * referenceX;
+            projectedDot = currentX * referenceX + currentY * referenceY;
+            break;
+    }
+    return atan2f(crossAlongAxis, projectedDot) * 57.29577951308232f;
+}
+
+// The upright gravity vector identifies the sensor axis that points mostly
+// vertically. Side-to-side motion then identifies roll from the two remaining
+// gyro axes; the last orthogonal axis is pitch.
+inline OrientationResult detectOrientationAxes(
+    float uprightAx,
+    float uprightAy,
+    float uprightAz,
+    float motionXDegSec,
+    float motionYDegSec,
+    float motionZDegSec
+) {
+    OrientationResult result;
+    const float acceleration[3] = {
+        fabsf(uprightAx), fabsf(uprightAy), fabsf(uprightAz)
+    };
+    const float motion[3] = {
+        fabsf(motionXDegSec), fabsf(motionYDegSec), fabsf(motionZDegSec)
+    };
+    const float gravityMagnitude = sqrtf(
+        uprightAx * uprightAx + uprightAy * uprightAy + uprightAz * uprightAz
+    );
+    if (!isfinite(gravityMagnitude) || gravityMagnitude < 0.65f || gravityMagnitude > 1.35f) {
+        return result;
+    }
+
+    uint8_t vertical = 0;
+    if (acceleration[1] > acceleration[vertical]) vertical = 1;
+    if (acceleration[2] > acceleration[vertical]) vertical = 2;
+
+    uint8_t firstHorizontal = vertical == 0 ? 1 : 0;
+    uint8_t secondHorizontal = vertical == 2 ? 1 : 2;
+    if (firstHorizontal == vertical) firstHorizontal = 0;
+    if (secondHorizontal == vertical || secondHorizontal == firstHorizontal) {
+        secondHorizontal = 3 - vertical - firstHorizontal;
+    }
+
+    const uint8_t roll = motion[firstHorizontal] >= motion[secondHorizontal]
+        ? firstHorizontal : secondHorizontal;
+    const uint8_t other = roll == firstHorizontal ? secondHorizontal : firstHorizontal;
+    const float strongestMotion = motion[roll];
+    const float competingMotion = motion[other];
+    const float confidence = strongestMotion / fmaxf(competingMotion, 0.1f);
+
+    result.verticalAxis = static_cast<RotationAxis>(vertical);
+    result.rollAxis = static_cast<RotationAxis>(roll);
+    result.pitchAxis = remainingRotationAxis(result.verticalAxis, result.rollAxis);
+    result.rollMotionDegSec = strongestMotion;
+    result.confidence = confidence;
+    result.valid = isfinite(strongestMotion) && isfinite(confidence) &&
+        strongestMotion >= 2.0f && confidence >= 1.25f;
+    return result;
 }
 
 inline void validateControllerSettings(ControllerSettings& s) {

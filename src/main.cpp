@@ -29,7 +29,7 @@
 // FIRMWARE
 // =====================================================
 
-constexpr const char* FIRMWARE_VERSION = "v0.11.0";
+constexpr const char* FIRMWARE_VERSION = "v0.12.0-testing";
 
 // =====================================================
 // WIFI / WEB
@@ -191,12 +191,6 @@ enum class OperatingMode {
     STANDBY
 };
 
-enum class RotationAxis : uint8_t {
-    X = 0,
-    Y = 1,
-    Z = 2
-};
-
 enum class DisplayPage {
     STATUS,
     SETTINGS,
@@ -209,9 +203,18 @@ enum class DisplayPage {
 // =====================================================
 
 RotationAxis rotationAxis = RotationAxis::Y;
+RotationAxis rollAxis = RotationAxis::X;
+RotationAxis verticalAxis = RotationAxis::Z;
+bool orientationConfigured = false;
 float gyroAxisBias = 0.0f;
+float rollGyroBias = 0.0f;
 float pitch = 0.0f;
 float pitchZero = 0.0f;
+float roll = 0.0f;
+float rollZero = 0.0f;
+float levelReferenceX = 0.0f;
+float levelReferenceY = 0.0f;
+float levelReferenceZ = 1.0f;
 
 // Absolute pitch is relative to startup/calibration zero.
 float currentAbsolutePitch = 0.0f;
@@ -223,6 +226,8 @@ float adaptiveBaseline = 0.0f;
 float currentTriggerPitch = 0.0f;
 
 float currentGyroRate = 0.0f;
+float currentRollAngle = 0.0f;
+float currentRollRate = 0.0f;
 
 // Live acceleration telemetry. v0.11 reports +G as dynamic linear
 // acceleration with the gravity vector removed, so a stationary bike
@@ -258,6 +263,9 @@ int imuFailureCount = 0;
 int imuRecoveryCount = 0;
 constexpr int IMU_FAILURE_LIMIT = 5;
 constexpr int IMU_RECOVERY_LIMIT = 20;
+constexpr unsigned long ORIENTATION_UPRIGHT_SAMPLE_MS = 1500;
+constexpr unsigned long ORIENTATION_MOTION_SAMPLE_MS = 8000;
+constexpr uint8_t ORIENTATION_START_DELAY_SECONDS = 4;
 
 unsigned long lastMicros = 0;
 unsigned long triggerStartTime = 0;
@@ -286,6 +294,7 @@ void forceOutputOff();
 void setOutputTarget(uint8_t target, bool immediate = false);
 void setOperatingMode(OperatingMode mode);
 bool calibrateMPU();
+bool runOrientationWizard();
 void startAccessPoint();
 void stopAccessPoint();
 void toggleAccessPointFromButton();
@@ -331,6 +340,24 @@ const char* getRotationAxisName() {
     return "Y";
 }
 
+const char* getAxisName(RotationAxis axis) {
+    switch (axis) {
+        case RotationAxis::X: return "X";
+        case RotationAxis::Y: return "Y";
+        case RotationAxis::Z: return "Z";
+    }
+    return "?";
+}
+
+const char* getAxisJsonName(RotationAxis axis) {
+    switch (axis) {
+        case RotationAxis::X: return "x";
+        case RotationAxis::Y: return "y";
+        case RotationAxis::Z: return "z";
+    }
+    return "unknown";
+}
+
 void loadSettings() {
     preferences.begin("wheelie", true);
 
@@ -354,6 +381,9 @@ void loadSettings() {
     settings.warningPattern = static_cast<LightPattern>(preferences.getUChar("wrnpat", 4));
     settings.warningBrightness = preferences.getUChar("wrnbright", 255);
     rotationAxis = static_cast<RotationAxis>(preferences.getUChar("rotaxis", 1));
+    rollAxis = static_cast<RotationAxis>(preferences.getUChar("rollaxis", 0));
+    verticalAxis = static_cast<RotationAxis>(preferences.getUChar("vertaxis", 2));
+    orientationConfigured = preferences.getBool("orientok", false);
     wifiApPassword = preferences.getString("wifipass", DEFAULT_WIFI_AP_PASSWORD);
     wifiApSsid = preferences.getString("apssid", "");
 
@@ -377,10 +407,15 @@ void loadSettings() {
     if (wifiApPassword.length() < 8 || wifiApPassword.length() > 63) {
         wifiApPassword = DEFAULT_WIFI_AP_PASSWORD;
     }
-    if (rotationAxis != RotationAxis::X &&
-        rotationAxis != RotationAxis::Y &&
-        rotationAxis != RotationAxis::Z) {
+    if (!isRotationAxisValid(rotationAxis)) {
         rotationAxis = RotationAxis::Y;
+    }
+    if (!isRotationAxisValid(rollAxis) || !isRotationAxisValid(verticalAxis) ||
+        rollAxis == rotationAxis || rollAxis == verticalAxis || rotationAxis == verticalAxis) {
+        rollAxis = RotationAxis::X;
+        rotationAxis = RotationAxis::Y;
+        verticalAxis = RotationAxis::Z;
+        orientationConfigured = false;
     }
     validateSettings();
 }
@@ -406,6 +441,9 @@ void saveSettings() {
     preferences.putUChar("wrnpat", static_cast<uint8_t>(settings.warningPattern));
     preferences.putUChar("wrnbright", settings.warningBrightness);
     preferences.putUChar("rotaxis", static_cast<uint8_t>(rotationAxis));
+    preferences.putUChar("rollaxis", static_cast<uint8_t>(rollAxis));
+    preferences.putUChar("vertaxis", static_cast<uint8_t>(verticalAxis));
+    preferences.putBool("orientok", orientationConfigured);
     preferences.putString("wifipass", wifiApPassword);
 
     preferences.end();
@@ -459,8 +497,8 @@ bool readMPU(MPUData &data) {
     return true;
 }
 
-float getSelectedGyroRate(const MPUData &data) {
-    switch (rotationAxis) {
+float getGyroRateForAxis(const MPUData &data, RotationAxis axis) {
+    switch (axis) {
         case RotationAxis::X: return data.gx;
         case RotationAxis::Y: return data.gy;
         case RotationAxis::Z: return data.gz;
@@ -468,23 +506,15 @@ float getSelectedGyroRate(const MPUData &data) {
     return data.gy;
 }
 
-float calculateAccelPitchFromVector(float ax, float ay, float az) {
-    switch (rotationAxis) {
-        case RotationAxis::X:
-            return atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI;
-        case RotationAxis::Y:
-            // Preserve the original/default mounting calculation.
-            return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
-        case RotationAxis::Z:
-            // When Z is the physical pitch axis, gravity rotates in the XY
-            // plane. Startup calibration supplies the arbitrary level zero.
-            return atan2(ax, ay) * 180.0f / PI;
-    }
-    return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+float getSelectedGyroRate(const MPUData &data) {
+    return getGyroRateForAxis(data, rotationAxis);
 }
 
-float calculateAccelPitch(const MPUData &data) {
-    return calculateAccelPitchFromVector(data.ax, data.ay, data.az);
+float calculateAccelAngleRelative(RotationAxis axis, const MPUData &data) {
+    return calculateRelativeRotationDegrees(
+        axis,
+        levelReferenceX, levelReferenceY, levelReferenceZ,
+        data.ax, data.ay, data.az);
 }
 
 // =====================================================
@@ -796,6 +826,165 @@ void updateDisplay() {
 // VIBRATION-TOLERANT CALIBRATION
 // =====================================================
 
+bool runOrientationWizard() {
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("MOUNTING / ORIENTATION WIZARD");
+    Serial.println("Hold upright, then lean side to side.");
+    Serial.println("======================================");
+
+    forceOutputOff();
+    manualTestActive = false;
+
+    for (uint8_t seconds = ORIENTATION_START_DELAY_SECONDS; seconds > 0; --seconds) {
+        char line[17];
+        oled.clearDisplay();
+        oledPrintRow(0, "MOUNTING SETUP");
+        oledPrintRow(2, "Hold bike upright");
+        oledPrintRow(4, "Do not lift it");
+        snprintf(line, sizeof(line), "Reading in %u...", seconds);
+        oledPrintRow(6, line);
+        delay(1000);
+    }
+
+    double sumAx = 0.0;
+    double sumAy = 0.0;
+    double sumAz = 0.0;
+    double sumGx = 0.0;
+    double sumGy = 0.0;
+    double sumGz = 0.0;
+    unsigned long uprightSamples = 0;
+    unsigned long started = millis();
+    MPUData data;
+
+    oled.clearDisplay();
+    oledPrintRow(0, "MOUNTING SETUP");
+    oledPrintRow(2, "Reading upright");
+    oledPrintRow(4, "Hold steady...");
+
+    while ((millis() - started) < ORIENTATION_UPRIGHT_SAMPLE_MS) {
+        if (readMPU(data)) {
+            const float magnitude = sqrtf(
+                data.ax * data.ax + data.ay * data.ay + data.az * data.az);
+            if (magnitude >= CAL_ACCEL_MAG_MIN_G && magnitude <= CAL_ACCEL_MAG_MAX_G) {
+                sumAx += data.ax;
+                sumAy += data.ay;
+                sumAz += data.az;
+                sumGx += data.gx;
+                sumGy += data.gy;
+                sumGz += data.gz;
+                uprightSamples++;
+            }
+        }
+        delay(2);
+    }
+
+    if (uprightSamples < 100) {
+        Serial.println("Orientation wizard failed: unable to read a stable upright pose");
+        oled.clearDisplay();
+        oledPrintRow(0, "SETUP FAILED");
+        oledPrintRow(2, "IMU not stable");
+        oledPrintRow(4, "Try in Settings");
+        delay(1800);
+        displayDirty = true;
+        return false;
+    }
+
+    const float avgAx = (float)(sumAx / uprightSamples);
+    const float avgAy = (float)(sumAy / uprightSamples);
+    const float avgAz = (float)(sumAz / uprightSamples);
+    const float biasGx = (float)(sumGx / uprightSamples);
+    const float biasGy = (float)(sumGy / uprightSamples);
+    const float biasGz = (float)(sumGz / uprightSamples);
+
+    double motionX = 0.0;
+    double motionY = 0.0;
+    double motionZ = 0.0;
+    unsigned long motionSamples = 0;
+    started = millis();
+    unsigned long lastShownSecond = UINT32_MAX;
+
+    oled.clearDisplay();
+    oledPrintRow(0, "LEAN SIDE-SIDE");
+    oledPrintRow(2, "Smoothly several");
+    oledPrintRow(3, "times while parked");
+    oledPrintRow(5, "Keep wheels down");
+
+    while ((millis() - started) < ORIENTATION_MOTION_SAMPLE_MS) {
+        if (readMPU(data)) {
+            motionX += fabsf(data.gx - biasGx);
+            motionY += fabsf(data.gy - biasGy);
+            motionZ += fabsf(data.gz - biasGz);
+            motionSamples++;
+        }
+
+        const unsigned long elapsedMs = millis() - started;
+        const unsigned long remainingMs = elapsedMs < ORIENTATION_MOTION_SAMPLE_MS
+            ? ORIENTATION_MOTION_SAMPLE_MS - elapsedMs : 0;
+        const unsigned long remainingSecond = (remainingMs + 999UL) / 1000UL;
+        if (remainingSecond != lastShownSecond) {
+            char line[17];
+            snprintf(line, sizeof(line), "%lu sec remaining", remainingSecond);
+            oledPrintRow(7, line);
+            lastShownSecond = remainingSecond;
+        }
+        delay(2);
+    }
+
+    if (motionSamples == 0) {
+        Serial.println("Orientation wizard failed: no motion samples");
+        oled.clearDisplay();
+        oledPrintRow(0, "SETUP FAILED");
+        oledPrintRow(2, "IMU read fault");
+        oledPrintRow(4, "Try in Settings");
+        delay(1800);
+        displayDirty = true;
+        return false;
+    }
+
+    const OrientationResult detected = detectOrientationAxes(
+        avgAx, avgAy, avgAz,
+        (float)(motionX / motionSamples),
+        (float)(motionY / motionSamples),
+        (float)(motionZ / motionSamples));
+
+    if (!detected.valid) {
+        Serial.printf(
+            "Orientation wizard failed: motion=%.2f dps confidence=%.2f\n",
+            detected.rollMotionDegSec, detected.confidence);
+        oled.clearDisplay();
+        oledPrintRow(0, "SETUP FAILED");
+        oledPrintRow(2, "Lean more clearly");
+        oledPrintRow(4, "Try in Settings");
+        delay(2200);
+        displayDirty = true;
+        return false;
+    }
+
+    verticalAxis = detected.verticalAxis;
+    rollAxis = detected.rollAxis;
+    rotationAxis = detected.pitchAxis;
+    orientationConfigured = true;
+    saveSettings();
+
+    Serial.printf(
+        "Orientation saved: vertical=%s roll=%s pitch=%s motion=%.2f confidence=%.2f\n",
+        getAxisName(verticalAxis), getAxisName(rollAxis), getAxisName(rotationAxis),
+        detected.rollMotionDegSec, detected.confidence);
+
+    char axes[17];
+    snprintf(axes, sizeof(axes), "R:%s  P:%s  V:%s",
+             getAxisName(rollAxis), getAxisName(rotationAxis), getAxisName(verticalAxis));
+    oled.clearDisplay();
+    oledPrintRow(0, "SETUP SAVED");
+    oledPrintRow(2, axes);
+    oledPrintRow(4, "Return upright");
+    oledPrintRow(6, "Calibration next");
+    delay(2500);
+    displayDirty = true;
+    return true;
+}
+
 bool calibrateMPU() {
     Serial.println();
     Serial.println("======================================");
@@ -815,6 +1004,7 @@ bool calibrateMPU() {
     double sumAy = 0.0;
     double sumAz = 0.0;
     double sumGy = 0.0;
+    double sumRollGy = 0.0;
 
     double sumAccelMag = 0.0;
     double sumAccelSq = 0.0;
@@ -838,11 +1028,13 @@ bool calibrateMPU() {
             data.az * data.az
         );
         float selectedGyroRate = getSelectedGyroRate(data);
+        float selectedRollRate = getGyroRateForAxis(data, rollAxis);
 
         bool usable =
             accelMag >= CAL_ACCEL_MAG_MIN_G &&
             accelMag <= CAL_ACCEL_MAG_MAX_G &&
-            fabsf(selectedGyroRate) <= CAL_MAX_GYRO_AXIS_DPS;
+            fabsf(selectedGyroRate) <= CAL_MAX_GYRO_AXIS_DPS &&
+            fabsf(selectedRollRate) <= CAL_MAX_GYRO_AXIS_DPS;
 
         if (!usable) {
             rejected++;
@@ -854,6 +1046,7 @@ bool calibrateMPU() {
         sumAy += data.ay;
         sumAz += data.az;
         sumGy += selectedGyroRate;
+        sumRollGy += selectedRollRate;
 
         // Track magnitude statistics separately from scale error. A clone
         // that reads 1.12 g at rest should not be mistaken for vibration.
@@ -886,8 +1079,14 @@ bool calibrateMPU() {
     float avgAz = (float)(sumAz / accepted);
 
     gyroAxisBias = (float)(sumGy / accepted);
-    pitchZero = calculateAccelPitchFromVector(avgAx, avgAy, avgAz);
-    pitch = pitchZero;
+    rollGyroBias = (float)(sumRollGy / accepted);
+    levelReferenceX = avgAx;
+    levelReferenceY = avgAy;
+    levelReferenceZ = avgAz;
+    pitchZero = 0.0f;
+    pitch = 0.0f;
+    rollZero = 0.0f;
+    roll = 0.0f;
 
     calibrationRestMagnitudeRaw = (float)(sumAccelMag / accepted);
     if (calibrationRestMagnitudeRaw > 0.5f && calibrationRestMagnitudeRaw < 1.5f) {
@@ -929,6 +1128,8 @@ bool calibrateMPU() {
     adaptiveBaseline = 0.0f;
     currentTriggerPitch = 0.0f;
     currentGyroRate = 0.0f;
+    currentRollAngle = 0.0f;
+    currentRollRate = 0.0f;
     adaptiveBaselineFrozen = false;
 
     imuHealthy = true;
@@ -937,6 +1138,7 @@ bool calibrateMPU() {
 
     Serial.printf("Calibration complete. Accepted=%d Rejected=%d\n", accepted, rejected);
     Serial.printf("Gyro %s bias: %.3f deg/s\n", getRotationAxisName(), gyroAxisBias);
+    Serial.printf("Roll gyro %s bias: %.3f deg/s\n", getAxisName(rollAxis), rollGyroBias);
     Serial.printf("Physical zero: %.2f deg\n", pitchZero);
     Serial.printf("Resting accel magnitude: %.4f raw g (scale x%.4f)\n", calibrationRestMagnitudeRaw, accelScaleCorrection);
     Serial.printf("Accel vibration RMS: %.4f g\n", calibrationAccelNoiseRms);
@@ -1442,7 +1644,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <div class="grid">
 <section class="card half"><h2>Wheelie Detection</h2><label>Angle processing mode</label><select id="angleMode"><option value="absolute">Absolute — fixed calibration zero</option><option value="adaptive">Adaptive — follows gradual terrain</option></select><div id="adaptiveSettings"><label>Adaptive zero time constant (seconds)</label><input id="adaptiveTau" type="number" min="0.5" max="60" step="0.5"><label>Freeze baseline above pitch rate (°/sec)</label><input id="freezeRate" type="number" min="1" max="100" step="0.5"><p class="note">The adaptive baseline follows hills slowly, but freezes during rapid pitch changes and wheelie detection.</p></div><label>Trigger angle (°)</label><input id="trigger" type="number" min="5" max="70" step="0.5"><label>Reset angle (°)</label><input id="reset" type="number" min="0" max="69" step="0.5"><label>Trigger hold (ms)</label><input id="hold" type="number" min="0" max="5000" step="10"><label>Minimum ON time (ms)</label><input id="minon" type="number" min="0" max="15000" step="50"></section>
 <section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
-<section class="card half"><h2>Sensor Mounting</h2><label for="rotationAxis">Pitch rotation axis</label><select id="rotationAxis"><option value="x">X axis</option><option value="y">Y axis — standard mounting</option><option value="z">Z axis</option></select><p class="note">Choose the MPU6050 gyro axis aligned with the motorcycle's pitch rotation. Changing this setting invalidates the current calibration and leaves the controller in STANDBY until recalibrated.</p></section>
+<section class="card half"><h2>Mounting & Orientation</h2><input type="hidden" id="rotationAxis" value="y"><div class="rows"><div class="row"><span>Setup</span><strong id="orientationState">---</strong></div><div class="row"><span>Pitch axis</span><strong id="pitchAxisLive">---</strong></div><div class="row"><span>Roll axis</span><strong id="rollAxisLive">---</strong></div><div class="row"><span>Vertical axis</span><strong id="verticalAxisLive">---</strong></div><div class="row"><span>Live lean</span><strong id="leanAngle">0.0°</strong></div></div><div class="actions"><button class="primary wide" onclick="runOrientationWizard()">Run Mounting Wizard</button></div><p class="note">This runs automatically on first setup and is saved in device memory. Park securely, hold the bike upright, then lean it smoothly side to side several times without lifting the wheels. Output remains OFF and the controller stays in STANDBY afterward.</p></section>
 <section class="card half"><h2>Dashboard Appearance</h2><label for="bikeColor">Motorcycle accent color</label><div style="display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center"><input id="bikeColor" type="color" value="#4ca6ff" style="height:54px;padding:5px;cursor:pointer"><div id="colorSwatch" style="height:54px;border-radius:11px;border:1px solid var(--line);background:var(--bikePreview);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div></div><label for="pitchTapeSetting">Pitch tape</label><select id="pitchTapeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><div class="actions"><button class="wide" type="button" onclick="resetBikeColor()">Reset Default Color</button></div><p class="note">Appearance preferences are stored by this browser and apply to the dashboard on this device.</p></section>
 <section class="card half"><h2>Pitch Display Alerts</h2><label for="wheelieEffectMode">Wheelie background</label><select id="wheelieEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><label for="wheelieEffectColor">Wheelie color</label><input id="wheelieEffectColor" type="color" value="#22c55e" style="height:48px;padding:5px;cursor:pointer"><label for="warningEffectMode">Angle warning background</label><select id="warningEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><div style="display:grid;grid-template-columns:1fr 82px;gap:10px"><div><label for="warningEffectAngle">Warning angle (°)</label><input id="warningEffectAngle" type="number" min="0" max="70" step="0.5" value="15"></div><div><label for="warningEffectColor">Color</label><input id="warningEffectColor" type="color" value="#ef4444" style="height:48px;padding:5px;cursor:pointer"></div></div><p class="note">Both effects are disabled by default. The high-angle warning takes priority whenever its threshold is reached.</p></section>
 <section class="card half"><h2>Physical Light Patterns</h2><label for="wheeliePattern">Wheelie pattern</label><select id="wheeliePattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningPattern">High-angle warning pattern</label><select id="warningPattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningBrightness">Warning brightness</label><div class="range"><input id="warningBrightness" type="range" min="1" max="100"><output id="warningBrightnessOut">100%</output></div><label for="warningAngleFirmware">Warning activation angle (°)</label><input id="warningAngleFirmware" type="number" min="5" max="85" step="0.5"><label for="warningResetFirmware">Warning release angle (°)</label><input id="warningResetFirmware" type="number" min="0" max="84" step="0.5"><label for="warningRateFirmware">Early warning pitch rate (°/s, 0 disables)</label><input id="warningRateFirmware" type="number" min="0" max="250" step="1"><p class="note">The warning uses angle hysteresis to prevent chatter. A rapid rise can activate it early after the normal wheelie threshold is crossed.</p></section>
@@ -1460,10 +1662,11 @@ function resetBikeColor(){applyBikeColor('#4ca6ff');msg('Dashboard bike color re
 $('bikeColor').addEventListener('input',e=>applyBikeColor(e.target.value));applyBikeColor(savedBikeColor);
 let savedPitchTape='on';try{savedPitchTape=localStorage.getItem('wheeliePitchTape')||'on'}catch(e){}$('pitchTapeSetting').value=savedPitchTape;$('pitchTapeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheeliePitchTape',e.target.value)}catch(err){}msg('Pitch tape preference saved')});
 const localValue=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};const effectFields={wheelieEffectMode:'off',wheelieEffectColor:'#22c55e',warningEffectMode:'off',warningEffectAngle:'15',warningEffectColor:'#ef4444'};Object.entries(effectFields).forEach(([id,fallback])=>{$(id).value=localValue(id,fallback);$(id).addEventListener('change',e=>{let value=e.target.value;if(id==='warningEffectAngle'){value=String(Math.max(0,Math.min(70,parseFloat(value)||15)));e.target.value=value}try{localStorage.setItem(id,value)}catch(err){}msg('Pitch alert preference saved')})});
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('orientationState').textContent=d.orientationConfigured?'SAVED':'REQUIRED';$('orientationState').className=d.orientationConfigured?'statusGood':'statusWarn';$('pitchAxisLive').textContent=d.rotationAxis.toUpperCase();$('rollAxisLive').textContent=d.rollAxis.toUpperCase();$('verticalAxisLive').textContent=d.verticalAxis.toUpperCase();$('leanAngle').textContent=d.roll.toFixed(1)+'°';$('rotationAxis').value=d.rotationAxis;$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
 async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();}
 async function setMode(mode){const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+mode,{method:'POST'});msg(await r.text());refresh();}
 async function calibrate(){msg('Calibrating — keep bike stationary...');const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());refresh();}
+async function runOrientationWizard(){if(!confirm('Park securely and run the mounting wizard now? The controller will enter STANDBY. Follow the OLED prompts: upright first, then lean side to side.'))return;msg('Wizard running — follow the OLED prompts on the bike...');try{const r=await fetch('/api/orientation?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());settingsLoaded=false;axisLoaded=false;refresh();refreshSsid()}catch(e){msg('Wizard connection failed — check the controller display')}}
 async function refreshSsid(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();$('apSsid').textContent=d.ssid;if(!axisLoaded){$('rotationAxis').value=d.rotationAxis;axisLoaded=true;}if(!advancedLoaded){$('wheeliePattern').value=d.wheeliePattern;$('warningPattern').value=d.warningPattern;$('warningBrightness').value=d.warningBrightness;$('warningBrightnessOut').textContent=d.warningBrightness+'%';$('warningAngleFirmware').value=d.warningAngle;$('warningResetFirmware').value=d.warningReset;$('warningRateFirmware').value=d.warningRate;advancedLoaded=true;}}catch(e){}}
 async function testOutput(level){const r=await fetch('/api/output?token='+encodeURIComponent(token)+'&level='+level,{method:'POST'});msg(await r.text());refresh();}
 async function saveWifiPassword(){const p=$('wifiPassword').value;if(p.length<8||p.length>63){msg('Wi-Fi password must be 8-63 characters');return;}if(!confirm('Change Wi-Fi password? You will need to reconnect.'))return;const body=new URLSearchParams({password:p});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());$('wifiPassword').value='';}catch(e){msg('Password saved; reconnect to the controller AP');}}
@@ -1503,6 +1706,8 @@ void handleStatus() {
     String json = "{";
     json += "\"pitch\":" + String(currentTriggerPitch, 2);
     json += ",\"rawPitch\":" + String(currentAbsolutePitch, 2);
+    json += ",\"roll\":" + String(currentRollAngle, 2);
+    json += ",\"rollRate\":" + String(currentRollRate, 2);
     json += ",\"baseline\":" + String(adaptiveBaseline, 2);
     json += ",\"gyroRate\":" + String(currentGyroRate, 2);
     json += ",\"gLoad\":" + String(currentGLoad, 3);
@@ -1533,6 +1738,9 @@ void handleStatus() {
         rotationAxis == RotationAxis::X ? "x" :
         (rotationAxis == RotationAxis::Z ? "z" : "y")
     ) + "\"";
+    json += ",\"rollAxis\":\"" + String(getAxisJsonName(rollAxis)) + "\"";
+    json += ",\"verticalAxis\":\"" + String(getAxisJsonName(verticalAxis)) + "\"";
+    json += ",\"orientationConfigured\":" + String(orientationConfigured ? "true" : "false");
     json += ",\"adaptiveTau\":" + String(settings.adaptiveTimeConstantSec, 1);
     json += ",\"freezeRate\":" + String(settings.adaptiveFreezeRateDegSec, 1);
     json += ",\"trigger\":" + String(settings.triggerAngle, 1);
@@ -1602,6 +1810,10 @@ void handleSettings() {
         server.send(400, "text/plain", "Invalid rotation axis");
         return;
     }
+    if (newRotationAxis != getAxisJsonName(rotationAxis)) {
+        server.send(409, "text/plain", "Use the mounting wizard to change sensor orientation");
+        return;
+    }
 
     if (newAdaptiveTau < 0.5f || newAdaptiveTau > 60.0f) {
         server.send(400, "text/plain", "Adaptive time must be 0.5-60 seconds");
@@ -1661,10 +1873,6 @@ void handleSettings() {
         return;
     }
 
-    RotationAxis selectedRotationAxis = newRotationAxis == "x" ? RotationAxis::X :
-        (newRotationAxis == "z" ? RotationAxis::Z : RotationAxis::Y);
-    bool rotationAxisChanged = selectedRotationAxis != rotationAxis;
-    rotationAxis = selectedRotationAxis;
     settings.angleMode = angleMode == "adaptive" ? AngleMode::ADAPTIVE : AngleMode::ABSOLUTE;
     settings.adaptiveTimeConstantSec = newAdaptiveTau;
     settings.adaptiveFreezeRateDegSec = newFreezeRate;
@@ -1687,16 +1895,9 @@ void handleSettings() {
     resetAdaptiveBaselineToCurrent();
     saveSettings();
 
-    if (rotationAxisChanged) {
-        setOperatingMode(OperatingMode::STANDBY);
-        imuHealthy = false;
-    }
-
     oled.clearDisplay();
     displayDirty = true;
-    server.send(200, "text/plain", rotationAxisChanged ?
-        "Settings saved. Rotation axis changed; recalibrate before arming." :
-        "Settings saved");
+    server.send(200, "text/plain", "Settings saved");
 }
 
 void handleMode() {
@@ -1883,6 +2084,35 @@ void handleFirmwareUpload() {
     }
 }
 
+void handleOrientationWizard() {
+    if (!requireWriteToken()) return;
+
+    setOperatingMode(OperatingMode::STANDBY);
+    forceOutputOff();
+    const bool orientationSuccess = runOrientationWizard();
+    bool calibrationSuccess = false;
+
+    if (orientationSuccess) {
+        for (uint8_t seconds = INITIAL_CALIBRATION_DELAY_SECONDS; seconds > 0; --seconds) {
+            char countdown[17];
+            snprintf(countdown, sizeof(countdown), "Starting in %u...", seconds);
+            drawCalibrationScreen(countdown);
+            delay(1000);
+        }
+        calibrationSuccess = calibrateMPU();
+    }
+
+    setOperatingMode(OperatingMode::STANDBY);
+    lastMicros = micros();
+    server.send(
+        orientationSuccess && calibrationSuccess ? 200 : 500,
+        "text/plain",
+        !orientationSuccess ? "Orientation not detected — previous setup preserved" :
+        (calibrationSuccess ? "Orientation saved and calibrated; controller left in STANDBY" :
+         "Orientation saved, but calibration failed — controller left in STANDBY")
+    );
+}
+
 void handleFirmwareRollback() {
     if (!requireWriteToken()) return;
 
@@ -1927,6 +2157,7 @@ void registerWebRoutes() {
     server.on("/api/settings", HTTP_POST, handleSettings);
     server.on("/api/mode", HTTP_POST, handleMode);
     server.on("/api/calibrate", HTTP_POST, handleCalibration);
+    server.on("/api/orientation", HTTP_POST, handleOrientationWizard);
     server.on("/api/output", HTTP_POST, handleManualOutput);
     server.on("/api/peak/reset", HTTP_POST, handlePeakReset);
     server.on("/api/wifi", HTTP_POST, handleWiFiPassword);
@@ -2133,16 +2364,23 @@ bool updateIMUAndPitch(float& dt) {
     currentGLoad += (instantaneousLinearG - currentGLoad) * gAlpha;
     if (currentGLoad < GLOAD_DEADBAND_G) currentGLoad = 0.0f;
 
-    float accelPitch = calculateAccelPitch(data);
+    float accelPitch = calculateAccelAngleRelative(rotationAxis, data);
     float gyroRate = getSelectedGyroRate(data) - gyroAxisBias;
+    float accelRoll = calculateAccelAngleRelative(rollAxis, data);
+    float rollRate = getGyroRateForAxis(data, rollAxis) - rollGyroBias;
 
     currentGyroRate = PITCH_SIGN * gyroRate;
+    currentRollRate = rollRate;
 
     pitch =
         FILTER_ALPHA * (pitch + gyroRate * dt) +
         (1.0f - FILTER_ALPHA) * accelPitch;
+    roll =
+        FILTER_ALPHA * (roll + rollRate * dt) +
+        (1.0f - FILTER_ALPHA) * accelRoll;
 
     currentAbsolutePitch = PITCH_SIGN * (pitch - pitchZero);
+    currentRollAngle = roll - rollZero;
 
     if (currentGLoad > highestGLoad) highestGLoad = currentGLoad;
     return true;
@@ -2224,6 +2462,17 @@ void setup() {
     writeMPURegister(CONFIG_REG, 0x03);   // ~44/42 Hz internal DLPF
     writeMPURegister(ACCEL_CONFIG, ACCEL_RANGE_CONFIG_VALUE); // +/-4g
     writeMPURegister(GYRO_CONFIG, 0x00);  // ±250 deg/s
+
+    if (!orientationConfigured) {
+        Serial.println("No saved mounting orientation; starting first-setup wizard.");
+        if (!runOrientationWizard()) {
+            Serial.println("Using safe default axes until the wizard is completed in Settings.");
+        }
+    } else {
+        Serial.printf("Saved orientation: vertical=%s roll=%s pitch=%s\n",
+                      getAxisName(verticalAxis), getAxisName(rollAxis),
+                      getAxisName(rotationAxis));
+    }
 
     Serial.printf("Initial calibration begins in %u seconds; level the bike now.\n",
                   INITIAL_CALIBRATION_DELAY_SECONDS);
