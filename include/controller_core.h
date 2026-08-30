@@ -1,10 +1,22 @@
 #pragma once
 
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 enum class AngleMode : uint8_t { ABSOLUTE = 0, ADAPTIVE = 1 };
 enum class LightPattern : uint8_t { OFF = 0, SOLID = 1, SLOW_PULSE = 2, FAST_PULSE = 3, STROBE = 4 };
+enum class RotationAxis : uint8_t { X = 0, Y = 1, Z = 2 };
+
+struct OrientationResult {
+    bool valid = false;
+    RotationAxis verticalAxis = RotationAxis::Z;
+    RotationAxis rollAxis = RotationAxis::X;
+    RotationAxis pitchAxis = RotationAxis::Y;
+    float rollMotionDegSec = 0.0f;
+    float confidence = 0.0f;
+};
 
 struct ControllerSettings {
     float triggerAngle = 20.0f;
@@ -27,11 +39,206 @@ struct ControllerSettings {
 
 enum class ControllerState : uint8_t { NORMAL, TRIGGER_PENDING, WHEELIE };
 
+constexpr uint16_t FIRMWARE_PACKAGE_HEADER_SIZE = 16;
+constexpr uint8_t FIRMWARE_PACKAGE_MAGIC[8] = {'W', 'C', 'T', 'R', 'L', '1', '\r', '\n'};
+constexpr uint16_t FIRMWARE_MANIFEST_MAX_SIZE = 768;
+constexpr uint16_t FIRMWARE_SIGNATURE_MAX_SIZE = 80;
+
+struct WriteRateLimitBucket {
+    uint32_t clientKey = 0;
+    uint32_t windowStartedMs = 0;
+    uint32_t blockedUntilMs = 0;
+    uint32_t lastSeenMs = 0;
+    uint8_t requestCount = 0;
+    bool occupied = false;
+};
+
+enum class WriteRateLimitDecision : uint8_t { ALLOW, BLOCK };
+
 // Hardware-independent helpers live here so the ESP32 firmware and desktop
 // regression suite exercise the same behavior. Keep this header free of
 // Arduino/ESP32 dependencies.
 inline float controllerClamp(float value, float low, float high) {
     return value < low ? low : (value > high ? high : value);
+}
+
+inline uint16_t readLittleEndian16(const uint8_t* data) {
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+inline uint32_t readLittleEndian32(const uint8_t* data) {
+    return (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
+
+inline bool hasFirmwarePackageMagic(const uint8_t* data, size_t size) {
+    if (size < sizeof(FIRMWARE_PACKAGE_MAGIC)) return false;
+    uint8_t difference = 0;
+    for (size_t index = 0; index < sizeof(FIRMWARE_PACKAGE_MAGIC); ++index) {
+        difference |= data[index] ^ FIRMWARE_PACKAGE_MAGIC[index];
+    }
+    return difference == 0;
+}
+
+inline bool isFirmwareMetadataCompatible(
+    const char* packageBoard,
+    const char* packageChannel,
+    const char* expectedBoard,
+    const char* selectedChannel
+) {
+    if (packageBoard == nullptr || packageChannel == nullptr ||
+        expectedBoard == nullptr || selectedChannel == nullptr) return false;
+    return strcmp(packageBoard, expectedBoard) == 0 &&
+        strcmp(packageChannel, selectedChannel) == 0;
+}
+
+inline WriteRateLimitDecision checkWriteRateLimit(
+    WriteRateLimitBucket* buckets,
+    size_t bucketCount,
+    uint32_t clientKey,
+    uint32_t nowMs,
+    uint8_t maximumRequests = 12,
+    uint32_t windowMs = 10000,
+    uint32_t blockMs = 30000
+) {
+    if (buckets == nullptr || bucketCount == 0) return WriteRateLimitDecision::BLOCK;
+
+    size_t selected = bucketCount;
+    size_t oldest = 0;
+    for (size_t index = 0; index < bucketCount; ++index) {
+        if (buckets[index].occupied && buckets[index].clientKey == clientKey) {
+            selected = index;
+            break;
+        }
+        if (!buckets[index].occupied) {
+            selected = index;
+            break;
+        }
+        if ((uint32_t)(nowMs - buckets[index].lastSeenMs) >
+            (uint32_t)(nowMs - buckets[oldest].lastSeenMs)) oldest = index;
+    }
+    if (selected == bucketCount) selected = oldest;
+
+    WriteRateLimitBucket& bucket = buckets[selected];
+    if (!bucket.occupied || bucket.clientKey != clientKey) {
+        bucket = WriteRateLimitBucket{};
+        bucket.occupied = true;
+        bucket.clientKey = clientKey;
+        bucket.windowStartedMs = nowMs;
+    }
+    bucket.lastSeenMs = nowMs;
+
+    if (bucket.blockedUntilMs != 0 &&
+        (int32_t)(bucket.blockedUntilMs - nowMs) > 0) {
+        return WriteRateLimitDecision::BLOCK;
+    }
+    bucket.blockedUntilMs = 0;
+
+    if ((uint32_t)(nowMs - bucket.windowStartedMs) >= windowMs) {
+        bucket.windowStartedMs = nowMs;
+        bucket.requestCount = 0;
+    }
+    if (bucket.requestCount >= maximumRequests) {
+        bucket.blockedUntilMs = nowMs + blockMs;
+        return WriteRateLimitDecision::BLOCK;
+    }
+    bucket.requestCount++;
+    return WriteRateLimitDecision::ALLOW;
+}
+
+inline bool isRotationAxisValid(RotationAxis axis) {
+    return axis == RotationAxis::X || axis == RotationAxis::Y || axis == RotationAxis::Z;
+}
+
+inline RotationAxis remainingRotationAxis(RotationAxis first, RotationAxis second) {
+    for (uint8_t value = 0; value < 3; ++value) {
+        const RotationAxis candidate = static_cast<RotationAxis>(value);
+        if (candidate != first && candidate != second) return candidate;
+    }
+    return RotationAxis::Y;
+}
+
+inline float calculateRelativeRotationDegrees(
+    RotationAxis axis,
+    float referenceX,
+    float referenceY,
+    float referenceZ,
+    float currentX,
+    float currentY,
+    float currentZ
+) {
+    float crossAlongAxis = 0.0f;
+    float projectedDot = 0.0f;
+    switch (axis) {
+        case RotationAxis::X:
+            crossAlongAxis = currentY * referenceZ - currentZ * referenceY;
+            projectedDot = currentY * referenceY + currentZ * referenceZ;
+            break;
+        case RotationAxis::Y:
+            crossAlongAxis = currentZ * referenceX - currentX * referenceZ;
+            projectedDot = currentX * referenceX + currentZ * referenceZ;
+            break;
+        case RotationAxis::Z:
+            crossAlongAxis = currentX * referenceY - currentY * referenceX;
+            projectedDot = currentX * referenceX + currentY * referenceY;
+            break;
+    }
+    return atan2f(crossAlongAxis, projectedDot) * 57.29577951308232f;
+}
+
+// The upright gravity vector identifies the sensor axis that points mostly
+// vertically. Side-to-side motion then identifies roll from the two remaining
+// gyro axes; the last orthogonal axis is pitch.
+inline OrientationResult detectOrientationAxes(
+    float uprightAx,
+    float uprightAy,
+    float uprightAz,
+    float motionXDegSec,
+    float motionYDegSec,
+    float motionZDegSec
+) {
+    OrientationResult result;
+    const float acceleration[3] = {
+        fabsf(uprightAx), fabsf(uprightAy), fabsf(uprightAz)
+    };
+    const float motion[3] = {
+        fabsf(motionXDegSec), fabsf(motionYDegSec), fabsf(motionZDegSec)
+    };
+    const float gravityMagnitude = sqrtf(
+        uprightAx * uprightAx + uprightAy * uprightAy + uprightAz * uprightAz
+    );
+    if (!isfinite(gravityMagnitude) || gravityMagnitude < 0.65f || gravityMagnitude > 1.35f) {
+        return result;
+    }
+
+    uint8_t vertical = 0;
+    if (acceleration[1] > acceleration[vertical]) vertical = 1;
+    if (acceleration[2] > acceleration[vertical]) vertical = 2;
+
+    uint8_t firstHorizontal = vertical == 0 ? 1 : 0;
+    uint8_t secondHorizontal = vertical == 2 ? 1 : 2;
+    if (firstHorizontal == vertical) firstHorizontal = 0;
+    if (secondHorizontal == vertical || secondHorizontal == firstHorizontal) {
+        secondHorizontal = 3 - vertical - firstHorizontal;
+    }
+
+    const uint8_t roll = motion[firstHorizontal] >= motion[secondHorizontal]
+        ? firstHorizontal : secondHorizontal;
+    const uint8_t other = roll == firstHorizontal ? secondHorizontal : firstHorizontal;
+    const float strongestMotion = motion[roll];
+    const float competingMotion = motion[other];
+    const float confidence = strongestMotion / fmaxf(competingMotion, 0.1f);
+
+    result.verticalAxis = static_cast<RotationAxis>(vertical);
+    result.rollAxis = static_cast<RotationAxis>(roll);
+    result.pitchAxis = remainingRotationAxis(result.verticalAxis, result.rollAxis);
+    result.rollMotionDegSec = strongestMotion;
+    result.confidence = confidence;
+    result.valid = isfinite(strongestMotion) && isfinite(confidence) &&
+        strongestMotion >= 2.0f && confidence >= 1.25f;
+    return result;
 }
 
 inline void validateControllerSettings(ControllerSettings& s) {

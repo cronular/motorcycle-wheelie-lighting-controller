@@ -7,6 +7,26 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+### Added
+
+- First-run OLED mounting wizard that detects upright, roll, and pitch axes from
+  a stationary pose followed by gentle side-to-side leaning.
+- Persistent orientation storage in device NVS plus a settings-page rerun flow.
+- Live roll/lean angle and roll-rate telemetry for future lean displays.
+- ECDSA P-256 signed `.wctrl` OTA packages with streamed SHA-256 verification.
+- Signed hardware, chip, channel, version, commit, date, and size metadata that
+  blocks incompatible or unsigned OTA images before partition activation.
+- Rolling `stable` and `testing` OTA releases sourced from `main` and `testing`.
+- Per-client write-endpoint rate limiting and write-token rotation after saved
+  configuration changes.
+- Optional per-device Wi-Fi password generation from the Settings page.
+- Firmware build commit, build date, release channel, and target diagnostics.
+
+### Changed
+
+- Dashboard OTA now accepts signed `.wctrl` packages only; raw `.bin` files
+  remain available solely for wired/factory flashing.
+
 ## [0.11.0] - 2026-08-29
 
 ### Added

@@ -5,6 +5,8 @@
 #include <esp_arduino_version.h>
 #include <esp_system.h>
 #include <esp_ota_ops.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/sha256.h>
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -13,6 +15,8 @@
 #include <Preferences.h>
 #include <Update.h>
 #include "controller_core.h"
+#include "firmware_signing_key.h"
+#include "build_metadata.generated.h"
 
 // =====================================================
 // FINAL-HARDWARE PIN ASSIGNMENTS
@@ -29,7 +33,19 @@
 // FIRMWARE
 // =====================================================
 
-constexpr const char* FIRMWARE_VERSION = "v0.11.0";
+constexpr const char* FIRMWARE_VERSION = "v0.12.0-testing";
+constexpr const char* TARGET_BOARD_ID = "seeed_xiao_esp32s3";
+constexpr const char* TARGET_CHIP_ID = "esp32s3";
+
+#ifndef BUILD_COMMIT
+#define BUILD_COMMIT "unknown"
+#endif
+#ifndef BUILD_DATE
+#define BUILD_DATE "unknown"
+#endif
+#ifndef RELEASE_CHANNEL
+#define RELEASE_CHANNEL "testing"
+#endif
 
 // =====================================================
 // WIFI / WEB
@@ -57,12 +73,43 @@ bool mdnsHealthy = false;
 bool accessPointEnabled = false;
 bool webRoutesRegistered = false;
 String writeToken;
+String otaChannel = RELEASE_CHANNEL;
+
+constexpr size_t WRITE_RATE_BUCKET_COUNT = 4;
+WriteRateLimitBucket writeRateBuckets[WRITE_RATE_BUCKET_COUNT];
 
 // A password change needs to let the HTTP response leave before the AP
 // disconnects. The main loop performs the restart after this delay.
 bool accessPointRestartPending = false;
 unsigned long accessPointRestartAtMs = 0;
 unsigned long wifiPasswordResetNoticeUntil = 0;
+
+struct FirmwareUploadState {
+    bool authorized = false;
+    bool rateLimited = false;
+    bool failed = false;
+    bool updateStarted = false;
+    bool hashInitialized = false;
+    bool complete = false;
+    String error;
+    uint8_t header[FIRMWARE_PACKAGE_HEADER_SIZE] = {};
+    size_t headerReceived = 0;
+    char manifest[FIRMWARE_MANIFEST_MAX_SIZE + 1] = {};
+    size_t manifestExpected = 0;
+    size_t manifestReceived = 0;
+    uint8_t signature[FIRMWARE_SIGNATURE_MAX_SIZE] = {};
+    size_t signatureExpected = 0;
+    size_t signatureReceived = 0;
+    uint32_t firmwareExpected = 0;
+    uint32_t firmwareReceived = 0;
+    String expectedSha256;
+    String packageVersion;
+    String packageCommit;
+    String packageBuilt;
+    mbedtls_sha256_context hashContext;
+};
+
+FirmwareUploadState firmwareUpload;
 
 // =====================================================
 // PERSISTENT SETTINGS
@@ -191,12 +238,6 @@ enum class OperatingMode {
     STANDBY
 };
 
-enum class RotationAxis : uint8_t {
-    X = 0,
-    Y = 1,
-    Z = 2
-};
-
 enum class DisplayPage {
     STATUS,
     SETTINGS,
@@ -209,9 +250,18 @@ enum class DisplayPage {
 // =====================================================
 
 RotationAxis rotationAxis = RotationAxis::Y;
+RotationAxis rollAxis = RotationAxis::X;
+RotationAxis verticalAxis = RotationAxis::Z;
+bool orientationConfigured = false;
 float gyroAxisBias = 0.0f;
+float rollGyroBias = 0.0f;
 float pitch = 0.0f;
 float pitchZero = 0.0f;
+float roll = 0.0f;
+float rollZero = 0.0f;
+float levelReferenceX = 0.0f;
+float levelReferenceY = 0.0f;
+float levelReferenceZ = 1.0f;
 
 // Absolute pitch is relative to startup/calibration zero.
 float currentAbsolutePitch = 0.0f;
@@ -223,6 +273,8 @@ float adaptiveBaseline = 0.0f;
 float currentTriggerPitch = 0.0f;
 
 float currentGyroRate = 0.0f;
+float currentRollAngle = 0.0f;
+float currentRollRate = 0.0f;
 
 // Live acceleration telemetry. v0.11 reports +G as dynamic linear
 // acceleration with the gravity vector removed, so a stationary bike
@@ -258,6 +310,9 @@ int imuFailureCount = 0;
 int imuRecoveryCount = 0;
 constexpr int IMU_FAILURE_LIMIT = 5;
 constexpr int IMU_RECOVERY_LIMIT = 20;
+constexpr unsigned long ORIENTATION_UPRIGHT_SAMPLE_MS = 1500;
+constexpr unsigned long ORIENTATION_MOTION_SAMPLE_MS = 8000;
+constexpr uint8_t ORIENTATION_START_DELAY_SECONDS = 4;
 
 unsigned long lastMicros = 0;
 unsigned long triggerStartTime = 0;
@@ -286,6 +341,8 @@ void forceOutputOff();
 void setOutputTarget(uint8_t target, bool immediate = false);
 void setOperatingMode(OperatingMode mode);
 bool calibrateMPU();
+bool runOrientationWizard();
+String makeWriteToken();
 void startAccessPoint();
 void stopAccessPoint();
 void toggleAccessPointFromButton();
@@ -331,6 +388,24 @@ const char* getRotationAxisName() {
     return "Y";
 }
 
+const char* getAxisName(RotationAxis axis) {
+    switch (axis) {
+        case RotationAxis::X: return "X";
+        case RotationAxis::Y: return "Y";
+        case RotationAxis::Z: return "Z";
+    }
+    return "?";
+}
+
+const char* getAxisJsonName(RotationAxis axis) {
+    switch (axis) {
+        case RotationAxis::X: return "x";
+        case RotationAxis::Y: return "y";
+        case RotationAxis::Z: return "z";
+    }
+    return "unknown";
+}
+
 void loadSettings() {
     preferences.begin("wheelie", true);
 
@@ -354,8 +429,12 @@ void loadSettings() {
     settings.warningPattern = static_cast<LightPattern>(preferences.getUChar("wrnpat", 4));
     settings.warningBrightness = preferences.getUChar("wrnbright", 255);
     rotationAxis = static_cast<RotationAxis>(preferences.getUChar("rotaxis", 1));
+    rollAxis = static_cast<RotationAxis>(preferences.getUChar("rollaxis", 0));
+    verticalAxis = static_cast<RotationAxis>(preferences.getUChar("vertaxis", 2));
+    orientationConfigured = preferences.getBool("orientok", false);
     wifiApPassword = preferences.getString("wifipass", DEFAULT_WIFI_AP_PASSWORD);
     wifiApSsid = preferences.getString("apssid", "");
+    otaChannel = preferences.getString("otachannel", RELEASE_CHANNEL);
 
     preferences.end();
 
@@ -377,10 +456,18 @@ void loadSettings() {
     if (wifiApPassword.length() < 8 || wifiApPassword.length() > 63) {
         wifiApPassword = DEFAULT_WIFI_AP_PASSWORD;
     }
-    if (rotationAxis != RotationAxis::X &&
-        rotationAxis != RotationAxis::Y &&
-        rotationAxis != RotationAxis::Z) {
+    if (otaChannel != "stable" && otaChannel != "testing") {
+        otaChannel = RELEASE_CHANNEL;
+    }
+    if (!isRotationAxisValid(rotationAxis)) {
         rotationAxis = RotationAxis::Y;
+    }
+    if (!isRotationAxisValid(rollAxis) || !isRotationAxisValid(verticalAxis) ||
+        rollAxis == rotationAxis || rollAxis == verticalAxis || rotationAxis == verticalAxis) {
+        rollAxis = RotationAxis::X;
+        rotationAxis = RotationAxis::Y;
+        verticalAxis = RotationAxis::Z;
+        orientationConfigured = false;
     }
     validateSettings();
 }
@@ -406,7 +493,11 @@ void saveSettings() {
     preferences.putUChar("wrnpat", static_cast<uint8_t>(settings.warningPattern));
     preferences.putUChar("wrnbright", settings.warningBrightness);
     preferences.putUChar("rotaxis", static_cast<uint8_t>(rotationAxis));
+    preferences.putUChar("rollaxis", static_cast<uint8_t>(rollAxis));
+    preferences.putUChar("vertaxis", static_cast<uint8_t>(verticalAxis));
+    preferences.putBool("orientok", orientationConfigured);
     preferences.putString("wifipass", wifiApPassword);
+    preferences.putString("otachannel", otaChannel);
 
     preferences.end();
     Serial.println("Settings saved to NVS");
@@ -459,8 +550,8 @@ bool readMPU(MPUData &data) {
     return true;
 }
 
-float getSelectedGyroRate(const MPUData &data) {
-    switch (rotationAxis) {
+float getGyroRateForAxis(const MPUData &data, RotationAxis axis) {
+    switch (axis) {
         case RotationAxis::X: return data.gx;
         case RotationAxis::Y: return data.gy;
         case RotationAxis::Z: return data.gz;
@@ -468,23 +559,15 @@ float getSelectedGyroRate(const MPUData &data) {
     return data.gy;
 }
 
-float calculateAccelPitchFromVector(float ax, float ay, float az) {
-    switch (rotationAxis) {
-        case RotationAxis::X:
-            return atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI;
-        case RotationAxis::Y:
-            // Preserve the original/default mounting calculation.
-            return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
-        case RotationAxis::Z:
-            // When Z is the physical pitch axis, gravity rotates in the XY
-            // plane. Startup calibration supplies the arbitrary level zero.
-            return atan2(ax, ay) * 180.0f / PI;
-    }
-    return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+float getSelectedGyroRate(const MPUData &data) {
+    return getGyroRateForAxis(data, rotationAxis);
 }
 
-float calculateAccelPitch(const MPUData &data) {
-    return calculateAccelPitchFromVector(data.ax, data.ay, data.az);
+float calculateAccelAngleRelative(RotationAxis axis, const MPUData &data) {
+    return calculateRelativeRotationDegrees(
+        axis,
+        levelReferenceX, levelReferenceY, levelReferenceZ,
+        data.ax, data.ay, data.az);
 }
 
 // =====================================================
@@ -796,6 +879,166 @@ void updateDisplay() {
 // VIBRATION-TOLERANT CALIBRATION
 // =====================================================
 
+bool runOrientationWizard() {
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("MOUNTING / ORIENTATION WIZARD");
+    Serial.println("Hold upright, then lean side to side.");
+    Serial.println("======================================");
+
+    forceOutputOff();
+    manualTestActive = false;
+
+    for (uint8_t seconds = ORIENTATION_START_DELAY_SECONDS; seconds > 0; --seconds) {
+        char line[17];
+        oled.clearDisplay();
+        oledPrintRow(0, "MOUNTING SETUP");
+        oledPrintRow(2, "Hold bike upright");
+        oledPrintRow(4, "Do not lift it");
+        snprintf(line, sizeof(line), "Reading in %u...", seconds);
+        oledPrintRow(6, line);
+        delay(1000);
+    }
+
+    double sumAx = 0.0;
+    double sumAy = 0.0;
+    double sumAz = 0.0;
+    double sumGx = 0.0;
+    double sumGy = 0.0;
+    double sumGz = 0.0;
+    unsigned long uprightSamples = 0;
+    unsigned long started = millis();
+    MPUData data;
+
+    oled.clearDisplay();
+    oledPrintRow(0, "MOUNTING SETUP");
+    oledPrintRow(2, "Reading upright");
+    oledPrintRow(4, "Hold steady...");
+
+    while ((millis() - started) < ORIENTATION_UPRIGHT_SAMPLE_MS) {
+        if (readMPU(data)) {
+            const float magnitude = sqrtf(
+                data.ax * data.ax + data.ay * data.ay + data.az * data.az);
+            if (magnitude >= CAL_ACCEL_MAG_MIN_G && magnitude <= CAL_ACCEL_MAG_MAX_G) {
+                sumAx += data.ax;
+                sumAy += data.ay;
+                sumAz += data.az;
+                sumGx += data.gx;
+                sumGy += data.gy;
+                sumGz += data.gz;
+                uprightSamples++;
+            }
+        }
+        delay(2);
+    }
+
+    if (uprightSamples < 100) {
+        Serial.println("Orientation wizard failed: unable to read a stable upright pose");
+        oled.clearDisplay();
+        oledPrintRow(0, "SETUP FAILED");
+        oledPrintRow(2, "IMU not stable");
+        oledPrintRow(4, "Try in Settings");
+        delay(1800);
+        displayDirty = true;
+        return false;
+    }
+
+    const float avgAx = (float)(sumAx / uprightSamples);
+    const float avgAy = (float)(sumAy / uprightSamples);
+    const float avgAz = (float)(sumAz / uprightSamples);
+    const float biasGx = (float)(sumGx / uprightSamples);
+    const float biasGy = (float)(sumGy / uprightSamples);
+    const float biasGz = (float)(sumGz / uprightSamples);
+
+    double motionX = 0.0;
+    double motionY = 0.0;
+    double motionZ = 0.0;
+    unsigned long motionSamples = 0;
+    started = millis();
+    unsigned long lastShownSecond = UINT32_MAX;
+
+    oled.clearDisplay();
+    oledPrintRow(0, "LEAN SIDE-SIDE");
+    oledPrintRow(2, "Smoothly several");
+    oledPrintRow(3, "times while parked");
+    oledPrintRow(5, "Keep wheels down");
+
+    while ((millis() - started) < ORIENTATION_MOTION_SAMPLE_MS) {
+        if (readMPU(data)) {
+            motionX += fabsf(data.gx - biasGx);
+            motionY += fabsf(data.gy - biasGy);
+            motionZ += fabsf(data.gz - biasGz);
+            motionSamples++;
+        }
+
+        const unsigned long elapsedMs = millis() - started;
+        const unsigned long remainingMs = elapsedMs < ORIENTATION_MOTION_SAMPLE_MS
+            ? ORIENTATION_MOTION_SAMPLE_MS - elapsedMs : 0;
+        const unsigned long remainingSecond = (remainingMs + 999UL) / 1000UL;
+        if (remainingSecond != lastShownSecond) {
+            char line[17];
+            snprintf(line, sizeof(line), "%lu sec remaining", remainingSecond);
+            oledPrintRow(7, line);
+            lastShownSecond = remainingSecond;
+        }
+        delay(2);
+    }
+
+    if (motionSamples == 0) {
+        Serial.println("Orientation wizard failed: no motion samples");
+        oled.clearDisplay();
+        oledPrintRow(0, "SETUP FAILED");
+        oledPrintRow(2, "IMU read fault");
+        oledPrintRow(4, "Try in Settings");
+        delay(1800);
+        displayDirty = true;
+        return false;
+    }
+
+    const OrientationResult detected = detectOrientationAxes(
+        avgAx, avgAy, avgAz,
+        (float)(motionX / motionSamples),
+        (float)(motionY / motionSamples),
+        (float)(motionZ / motionSamples));
+
+    if (!detected.valid) {
+        Serial.printf(
+            "Orientation wizard failed: motion=%.2f dps confidence=%.2f\n",
+            detected.rollMotionDegSec, detected.confidence);
+        oled.clearDisplay();
+        oledPrintRow(0, "SETUP FAILED");
+        oledPrintRow(2, "Lean more clearly");
+        oledPrintRow(4, "Try in Settings");
+        delay(2200);
+        displayDirty = true;
+        return false;
+    }
+
+    verticalAxis = detected.verticalAxis;
+    rollAxis = detected.rollAxis;
+    rotationAxis = detected.pitchAxis;
+    orientationConfigured = true;
+    saveSettings();
+    writeToken = makeWriteToken();
+
+    Serial.printf(
+        "Orientation saved: vertical=%s roll=%s pitch=%s motion=%.2f confidence=%.2f\n",
+        getAxisName(verticalAxis), getAxisName(rollAxis), getAxisName(rotationAxis),
+        detected.rollMotionDegSec, detected.confidence);
+
+    char axes[17];
+    snprintf(axes, sizeof(axes), "R:%s  P:%s  V:%s",
+             getAxisName(rollAxis), getAxisName(rotationAxis), getAxisName(verticalAxis));
+    oled.clearDisplay();
+    oledPrintRow(0, "SETUP SAVED");
+    oledPrintRow(2, axes);
+    oledPrintRow(4, "Return upright");
+    oledPrintRow(6, "Calibration next");
+    delay(2500);
+    displayDirty = true;
+    return true;
+}
+
 bool calibrateMPU() {
     Serial.println();
     Serial.println("======================================");
@@ -815,6 +1058,7 @@ bool calibrateMPU() {
     double sumAy = 0.0;
     double sumAz = 0.0;
     double sumGy = 0.0;
+    double sumRollGy = 0.0;
 
     double sumAccelMag = 0.0;
     double sumAccelSq = 0.0;
@@ -838,11 +1082,13 @@ bool calibrateMPU() {
             data.az * data.az
         );
         float selectedGyroRate = getSelectedGyroRate(data);
+        float selectedRollRate = getGyroRateForAxis(data, rollAxis);
 
         bool usable =
             accelMag >= CAL_ACCEL_MAG_MIN_G &&
             accelMag <= CAL_ACCEL_MAG_MAX_G &&
-            fabsf(selectedGyroRate) <= CAL_MAX_GYRO_AXIS_DPS;
+            fabsf(selectedGyroRate) <= CAL_MAX_GYRO_AXIS_DPS &&
+            fabsf(selectedRollRate) <= CAL_MAX_GYRO_AXIS_DPS;
 
         if (!usable) {
             rejected++;
@@ -854,6 +1100,7 @@ bool calibrateMPU() {
         sumAy += data.ay;
         sumAz += data.az;
         sumGy += selectedGyroRate;
+        sumRollGy += selectedRollRate;
 
         // Track magnitude statistics separately from scale error. A clone
         // that reads 1.12 g at rest should not be mistaken for vibration.
@@ -886,8 +1133,14 @@ bool calibrateMPU() {
     float avgAz = (float)(sumAz / accepted);
 
     gyroAxisBias = (float)(sumGy / accepted);
-    pitchZero = calculateAccelPitchFromVector(avgAx, avgAy, avgAz);
-    pitch = pitchZero;
+    rollGyroBias = (float)(sumRollGy / accepted);
+    levelReferenceX = avgAx;
+    levelReferenceY = avgAy;
+    levelReferenceZ = avgAz;
+    pitchZero = 0.0f;
+    pitch = 0.0f;
+    rollZero = 0.0f;
+    roll = 0.0f;
 
     calibrationRestMagnitudeRaw = (float)(sumAccelMag / accepted);
     if (calibrationRestMagnitudeRaw > 0.5f && calibrationRestMagnitudeRaw < 1.5f) {
@@ -929,6 +1182,8 @@ bool calibrateMPU() {
     adaptiveBaseline = 0.0f;
     currentTriggerPitch = 0.0f;
     currentGyroRate = 0.0f;
+    currentRollAngle = 0.0f;
+    currentRollRate = 0.0f;
     adaptiveBaselineFrozen = false;
 
     imuHealthy = true;
@@ -937,6 +1192,7 @@ bool calibrateMPU() {
 
     Serial.printf("Calibration complete. Accepted=%d Rejected=%d\n", accepted, rejected);
     Serial.printf("Gyro %s bias: %.3f deg/s\n", getRotationAxisName(), gyroAxisBias);
+    Serial.printf("Roll gyro %s bias: %.3f deg/s\n", getAxisName(rollAxis), rollGyroBias);
     Serial.printf("Physical zero: %.2f deg\n", pitchZero);
     Serial.printf("Resting accel magnitude: %.4f raw g (scale x%.4f)\n", calibrationRestMagnitudeRaw, accelScaleCorrection);
     Serial.printf("Accel vibration RMS: %.4f g\n", calibrationAccelNoiseRms);
@@ -1059,6 +1315,7 @@ void toggleAngleModeFromButton() {
 
     // Button-selected angle mode is persistent, just like a web change.
     saveSettings();
+    writeToken = makeWriteToken();
 
     Serial.print("ANGLE MODE -> ");
     Serial.println(getAngleModeName());
@@ -1105,6 +1362,7 @@ void resolveShortTapGesture() {
 void resetWiFiPasswordToDefault() {
     wifiApPassword = DEFAULT_WIFI_AP_PASSWORD;
     saveSettings();
+    writeToken = makeWriteToken();
 
     // A 30-second physical hold is the recovery path, so make sure the AP
     // is actually available with the default credential afterward.
@@ -1255,15 +1513,55 @@ String makeWriteToken() {
 }
 
 bool validWriteToken() {
-    return server.hasArg("token") && server.arg("token") == writeToken;
+    if (!server.hasArg("token")) return false;
+    const String supplied = server.arg("token");
+    if (supplied.length() != writeToken.length()) return false;
+    uint8_t difference = 0;
+    for (size_t index = 0; index < writeToken.length(); ++index) {
+        difference |= (uint8_t)supplied[index] ^ (uint8_t)writeToken[index];
+    }
+    return difference == 0;
+}
+
+bool consumeWriteRequestLimit() {
+    const uint32_t clientKey = (uint32_t)server.client().remoteIP();
+    return checkWriteRateLimit(
+        writeRateBuckets, WRITE_RATE_BUCKET_COUNT, clientKey, millis()) ==
+        WriteRateLimitDecision::ALLOW;
+}
+
+bool allowWriteRequest() {
+    if (!consumeWriteRequestLimit()) {
+        server.sendHeader("Retry-After", "30");
+        server.send(429, "text/plain", "Too many write requests — retry in 30 seconds");
+        return false;
+    }
+    return true;
 }
 
 bool requireWriteToken() {
+    if (!allowWriteRequest()) return false;
     if (!validWriteToken()) {
         server.send(403, "text/plain", "Invalid write token");
         return false;
     }
     return true;
+}
+
+void rotateWriteToken() {
+    writeToken = makeWriteToken();
+    server.sendHeader("X-Write-Token", writeToken);
+}
+
+String generateUniqueWiFiPassword() {
+    static constexpr char alphabet[] =
+        "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    String generated;
+    generated.reserve(16);
+    for (uint8_t index = 0; index < 16; ++index) {
+        generated += alphabet[esp_random() % (sizeof(alphabet) - 1)];
+    }
+    return generated;
 }
 
 // =====================================================
@@ -1434,7 +1732,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Wheelie Settings</title>
 <style>
-:root{color-scheme:dark;--bg:#080b10;--panel:#111720;--line:#273449;--text:#f4f7fb;--muted:#8f9bad;--accent:#4ea1ff;--accent2:#8f66ff;--good:#52df9a;--warn:#ffc857;--bad:#ff6577}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0,rgba(78,161,255,.18),transparent 30%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{width:min(940px,100%);margin:auto;padding:16px}.top{display:flex;align-items:center;gap:10px;margin:4px 0 15px}.back{width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--line);border-radius:13px;background:#111720;color:white;text-decoration:none;font-size:24px}.title h1{font-size:25px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:13px}.card{grid-column:span 12;background:linear-gradient(180deg,#151d28,#0f151e);border:1px solid var(--line);border-radius:18px;padding:17px}@media(min-width:740px){.half{grid-column:span 6}}h2{font-size:15px;margin:0 0 13px}.rows{display:grid}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}.row span,label{color:var(--muted)}label{display:block;font-size:12px;margin:12px 0 6px}input,select{width:100%;padding:12px;border-radius:11px;border:1px solid var(--line);background:#090e15;color:white;font:inherit}.range{display:grid;grid-template-columns:1fr 78px;gap:9px;align-items:center}.range input{padding:0}.range output{text-align:center;background:#090e15;border:1px solid var(--line);border-radius:10px;padding:9px 4px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.wide{grid-column:1/-1}button{border:0;border-radius:11px;padding:13px;font:inherit;font-weight:750;background:#29364a;color:white;cursor:pointer}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2))}.good{background:#173b2d;color:#7cf5b9;border:1px solid #245c43}.warn{background:#3b3118;color:#ffd978;border:1px solid #665326}.bad{background:#421e27;color:#ff9dab;border:1px solid #6d2f3d}.note{font-size:12px;line-height:1.5;color:var(--muted)}.message{position:sticky;bottom:10px;width:max-content;max-width:100%;margin:14px auto 0;padding:9px 14px;background:#121a25;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}.hidden{display:none}.file{border-style:dashed}.statusGood{color:var(--good)}.statusBad{color:var(--bad)}
+:root{color-scheme:dark;--bg:#080b10;--panel:#111720;--line:#273449;--text:#f4f7fb;--muted:#8f9bad;--accent:#4ea1ff;--accent2:#8f66ff;--good:#52df9a;--warn:#ffc857;--bad:#ff6577}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0,rgba(78,161,255,.18),transparent 30%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{width:min(940px,100%);margin:auto;padding:16px}.top{display:flex;align-items:center;gap:10px;margin:4px 0 15px}.back{width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--line);border-radius:13px;background:#111720;color:white;text-decoration:none;font-size:24px}.title h1{font-size:25px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:13px}.card{grid-column:span 12;background:linear-gradient(180deg,#151d28,#0f151e);border:1px solid var(--line);border-radius:18px;padding:17px}@media(min-width:740px){.half{grid-column:span 6}}h2{font-size:15px;margin:0 0 13px}.rows{display:grid}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}.row span,label{color:var(--muted)}label{display:block;font-size:12px;margin:12px 0 6px}input,select{width:100%;padding:12px;border-radius:11px;border:1px solid var(--line);background:#090e15;color:white;font:inherit}.range{display:grid;grid-template-columns:1fr 78px;gap:9px;align-items:center}.range input{padding:0}.range output{text-align:center;background:#090e15;border:1px solid var(--line);border-radius:10px;padding:9px 4px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.wide{grid-column:1/-1}button{border:0;border-radius:11px;padding:13px;font:inherit;font-weight:750;background:#29364a;color:white;cursor:pointer}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2))}.good{background:#173b2d;color:#7cf5b9;border:1px solid #245c43}.warn{background:#3b3118;color:#ffd978;border:1px solid #665326}.bad{background:#421e27;color:#ff9dab;border:1px solid #6d2f3d}.note{font-size:12px;line-height:1.5;color:var(--muted)}.message{position:sticky;bottom:10px;width:max-content;max-width:100%;margin:14px auto 0;padding:9px 14px;background:#121a25;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}.hidden{display:none}.file{border-style:dashed}.statusGood{color:var(--good)}.statusBad{color:var(--bad)}.statusWarn{color:var(--warn)}
 </style>
 </head>
 <body><div class="wrap">
@@ -1442,15 +1740,15 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <div class="grid">
 <section class="card half"><h2>Wheelie Detection</h2><label>Angle processing mode</label><select id="angleMode"><option value="absolute">Absolute — fixed calibration zero</option><option value="adaptive">Adaptive — follows gradual terrain</option></select><div id="adaptiveSettings"><label>Adaptive zero time constant (seconds)</label><input id="adaptiveTau" type="number" min="0.5" max="60" step="0.5"><label>Freeze baseline above pitch rate (°/sec)</label><input id="freezeRate" type="number" min="1" max="100" step="0.5"><p class="note">The adaptive baseline follows hills slowly, but freezes during rapid pitch changes and wheelie detection.</p></div><label>Trigger angle (°)</label><input id="trigger" type="number" min="5" max="70" step="0.5"><label>Reset angle (°)</label><input id="reset" type="number" min="0" max="69" step="0.5"><label>Trigger hold (ms)</label><input id="hold" type="number" min="0" max="5000" step="10"><label>Minimum ON time (ms)</label><input id="minon" type="number" min="0" max="15000" step="50"></section>
 <section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
-<section class="card half"><h2>Sensor Mounting</h2><label for="rotationAxis">Pitch rotation axis</label><select id="rotationAxis"><option value="x">X axis</option><option value="y">Y axis — standard mounting</option><option value="z">Z axis</option></select><p class="note">Choose the MPU6050 gyro axis aligned with the motorcycle's pitch rotation. Changing this setting invalidates the current calibration and leaves the controller in STANDBY until recalibrated.</p></section>
+<section class="card half"><h2>Mounting & Orientation</h2><input type="hidden" id="rotationAxis" value="y"><div class="rows"><div class="row"><span>Setup</span><strong id="orientationState">---</strong></div><div class="row"><span>Pitch axis</span><strong id="pitchAxisLive">---</strong></div><div class="row"><span>Roll axis</span><strong id="rollAxisLive">---</strong></div><div class="row"><span>Vertical axis</span><strong id="verticalAxisLive">---</strong></div><div class="row"><span>Live lean</span><strong id="leanAngle">0.0°</strong></div></div><div class="actions"><button class="primary wide" onclick="runOrientationWizard()">Run Mounting Wizard</button></div><p class="note">This runs automatically on first setup and is saved in device memory. Park securely, hold the bike upright, then lean it smoothly side to side several times without lifting the wheels. Output remains OFF and the controller stays in STANDBY afterward.</p></section>
 <section class="card half"><h2>Dashboard Appearance</h2><label for="bikeColor">Motorcycle accent color</label><div style="display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center"><input id="bikeColor" type="color" value="#4ca6ff" style="height:54px;padding:5px;cursor:pointer"><div id="colorSwatch" style="height:54px;border-radius:11px;border:1px solid var(--line);background:var(--bikePreview);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div></div><label for="pitchTapeSetting">Pitch tape</label><select id="pitchTapeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><div class="actions"><button class="wide" type="button" onclick="resetBikeColor()">Reset Default Color</button></div><p class="note">Appearance preferences are stored by this browser and apply to the dashboard on this device.</p></section>
 <section class="card half"><h2>Pitch Display Alerts</h2><label for="wheelieEffectMode">Wheelie background</label><select id="wheelieEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><label for="wheelieEffectColor">Wheelie color</label><input id="wheelieEffectColor" type="color" value="#22c55e" style="height:48px;padding:5px;cursor:pointer"><label for="warningEffectMode">Angle warning background</label><select id="warningEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><div style="display:grid;grid-template-columns:1fr 82px;gap:10px"><div><label for="warningEffectAngle">Warning angle (°)</label><input id="warningEffectAngle" type="number" min="0" max="70" step="0.5" value="15"></div><div><label for="warningEffectColor">Color</label><input id="warningEffectColor" type="color" value="#ef4444" style="height:48px;padding:5px;cursor:pointer"></div></div><p class="note">Both effects are disabled by default. The high-angle warning takes priority whenever its threshold is reached.</p></section>
 <section class="card half"><h2>Physical Light Patterns</h2><label for="wheeliePattern">Wheelie pattern</label><select id="wheeliePattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningPattern">High-angle warning pattern</label><select id="warningPattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningBrightness">Warning brightness</label><div class="range"><input id="warningBrightness" type="range" min="1" max="100"><output id="warningBrightnessOut">100%</output></div><label for="warningAngleFirmware">Warning activation angle (°)</label><input id="warningAngleFirmware" type="number" min="5" max="85" step="0.5"><label for="warningResetFirmware">Warning release angle (°)</label><input id="warningResetFirmware" type="number" min="0" max="84" step="0.5"><label for="warningRateFirmware">Early warning pitch rate (°/s, 0 disables)</label><input id="warningRateFirmware" type="number" min="0" max="250" step="1"><p class="note">The warning uses angle hysteresis to prevent chatter. A rapid rise can activate it early after the normal wheelie threshold is crossed.</p></section>
 <section class="card half"><h2>Controller</h2><div class="rows"><div class="row"><span>Current mode</span><strong id="mode">---</strong></div><div class="row"><span>IMU</span><strong id="imu">---</strong></div><div class="row"><span>Angle mode</span><strong id="angleModeLive">---</strong></div><div class="row"><span>Current +G load</span><strong id="gload">---</strong></div></div><div class="actions"><button class="good" onclick="setMode('armed')">ARM</button><button class="warn" onclick="setMode('standby')">STANDBY</button><button class="bad wide" onclick="calibrate()">Recalibrate Level</button></div><p class="note">Engine-idle vibration is acceptable during calibration as long as the motorcycle remains stationary and is not being rocked.</p></section>
 <section class="card half"><h2>Manual Output Test</h2><div class="actions"><button onclick="testOutput(25)">25%</button><button onclick="testOutput(50)">50%</button><button onclick="testOutput(75)">75%</button><button onclick="testOutput(100)">100%</button><button class="bad wide" onclick="testOutput(0)">OFF</button></div><p class="note">Only available in STANDBY. Non-zero test commands automatically expire after 10 seconds.</p></section>
-<section class="card half"><h2>Network & System</h2><div class="rows"><div class="row"><span>Access point</span><strong id="apState">ON</strong></div><div class="row"><span>SSID</span><strong id="apSsid">---</strong></div><div class="row"><span>Friendly address</span><strong>wheelie.local</strong></div><div class="row"><span>Guaranteed fallback</span><strong>192.168.4.1</strong></div><div class="row"><span>Discovery</span><strong id="discovery">---</strong></div><div class="row"><span>Clients</span><strong id="clients">0</strong></div><div class="row"><span>Uptime</span><strong id="uptime">0 sec</strong></div><div class="row"><span>Firmware</span><strong id="firmware">---</strong></div></div><label>Wi-Fi password</label><input id="wifiPassword" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="Enter a new 8-63 character password"><div class="actions"><button class="primary wide" onclick="saveWifiPassword()">Update Wi-Fi Password</button></div><p class="note">Changing the password restarts the access point and disconnects this browser. Reconnect to the SSID shown above with the new password. Hold the physical button for <b>30 seconds</b> at any time to restore the default password <b>wheeliectrl</b> and turn the AP back on.</p><p class="note"><b>Triple-tap</b> toggles the access point. v0.11 also runs mDNS plus a captive DNS/portal fallback; if <b>wheelie.local</b> is not supported by the phone, the portal should open automatically or you can always use <b>192.168.4.1</b>.</p></section>
+<section class="card half"><h2>Network & System</h2><div class="rows"><div class="row"><span>Access point</span><strong id="apState">ON</strong></div><div class="row"><span>SSID</span><strong id="apSsid">---</strong></div><div class="row"><span>Friendly address</span><strong>wheelie.local</strong></div><div class="row"><span>Guaranteed fallback</span><strong>192.168.4.1</strong></div><div class="row"><span>Discovery</span><strong id="discovery">---</strong></div><div class="row"><span>Clients</span><strong id="clients">0</strong></div><div class="row"><span>Uptime</span><strong id="uptime">0 sec</strong></div><div class="row"><span>Firmware</span><strong id="firmware">---</strong></div><div class="row"><span>Build commit</span><strong id="buildCommit">---</strong></div><div class="row"><span>Build date</span><strong id="buildDate">---</strong></div><div class="row"><span>Release channel</span><strong id="releaseChannel">---</strong></div><div class="row"><span>Hardware target</span><strong id="hardwareTarget">---</strong></div></div><label>Wi-Fi password</label><input id="wifiPassword" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="Enter a new 8-63 character password"><div class="actions"><button class="primary wide" onclick="saveWifiPassword()">Update Wi-Fi Password</button><button class="wide" onclick="generateWifiPassword()">Generate Unique Device Password</button></div><p class="note">Changing or generating the password restarts the access point and disconnects this browser. A generated password is shown once so it can be copied before reconnecting. Hold the physical button for <b>30 seconds</b> to restore <b>wheeliectrl</b>.</p><p class="note"><b>Triple-tap</b> toggles the access point. mDNS and the captive DNS/portal fallback remain enabled; use <b>192.168.4.1</b> if <b>wheelie.local</b> is unavailable.</p></section>
 <section class="card half"><h2>Configuration Backup</h2><div class="actions"><button onclick="exportSettings()">Export JSON</button><button onclick="$('settingsFile').click()">Import JSON</button></div><input class="file hidden" id="settingsFile" type="file" accept=".json,application/json"><p class="note">Export includes controller settings and browser-local dashboard appearance. Imported values are validated by the controller when applied.</p></section>
-<section class="card half"><h2>Firmware Update & Recovery</h2><input class="file" id="firmwareFile" type="file" accept=".bin,application/octet-stream"><div class="actions"><button class="primary wide" onclick="uploadFirmware()">Upload OTA Firmware</button><button class="bad wide" onclick="rollbackFirmware()">Return to Previous Firmware</button></div><p class="note">The output is forced OFF during updates and rollback. The previous image remains in the alternate OTA partition until another update replaces it.</p></section>
+<section class="card half"><h2>Firmware Update & Recovery</h2><label for="otaChannel">Accepted OTA channel</label><select id="otaChannel"><option value="stable">Stable — main branch releases</option><option value="testing">Testing — testing branch builds</option></select><input class="file" id="firmwareFile" type="file" accept=".wctrl,application/octet-stream"><div class="actions"><button class="primary wide" onclick="uploadFirmware()">Upload Signed OTA Package</button><button class="bad wide" onclick="rollbackFirmware()">Return to Previous Firmware</button></div><p class="note">Only signed <b>.wctrl</b> packages for this XIAO ESP32-S3 and the selected channel are accepted. The firmware SHA-256 and ECDSA signature are verified before the OTA partition is activated. Save Settings after changing channels.</p><p class="note">The output is forced OFF during updates and rollback. The previous image remains in the alternate OTA partition until another update replaces it.</p></section>
 </div><div class="message" id="message">Ready</div></div>
 <script>
 let token='',settingsLoaded=false,axisLoaded=false,advancedLoaded=false;const $=id=>document.getElementById(id);const msg=t=>$('message').textContent=t;function syncAdaptive(){$('adaptiveSettings').classList.toggle('hidden',$('angleMode').value!=='adaptive');}$('angleMode').addEventListener('change',syncAdaptive);$('brightness').addEventListener('input',()=>$('brightnessOut').textContent=$('brightness').value+'%');$('fade').addEventListener('input',()=>$('fadeOut').textContent=$('fade').value+' ms');$('warningBrightness').addEventListener('input',()=>$('warningBrightnessOut').textContent=$('warningBrightness').value+'%');
@@ -1460,17 +1758,19 @@ function resetBikeColor(){applyBikeColor('#4ca6ff');msg('Dashboard bike color re
 $('bikeColor').addEventListener('input',e=>applyBikeColor(e.target.value));applyBikeColor(savedBikeColor);
 let savedPitchTape='on';try{savedPitchTape=localStorage.getItem('wheeliePitchTape')||'on'}catch(e){}$('pitchTapeSetting').value=savedPitchTape;$('pitchTapeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheeliePitchTape',e.target.value)}catch(err){}msg('Pitch tape preference saved')});
 const localValue=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};const effectFields={wheelieEffectMode:'off',wheelieEffectColor:'#22c55e',warningEffectMode:'off',warningEffectAngle:'15',warningEffectColor:'#ef4444'};Object.entries(effectFields).forEach(([id,fallback])=>{$(id).value=localValue(id,fallback);$(id).addEventListener('change',e=>{let value=e.target.value;if(id==='warningEffectAngle'){value=String(Math.max(0,Math.min(70,parseFloat(value)||15)));e.target.value=value}try{localStorage.setItem(id,value)}catch(err){}msg('Pitch alert preference saved')})});
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
-async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('orientationState').textContent=d.orientationConfigured?'SAVED':'REQUIRED';$('orientationState').className=d.orientationConfigured?'statusGood':'statusWarn';$('pitchAxisLive').textContent=d.rotationAxis.toUpperCase();$('rollAxisLive').textContent=d.rollAxis.toUpperCase();$('verticalAxisLive').textContent=d.verticalAxis.toUpperCase();$('leanAngle').textContent=d.roll.toFixed(1)+'°';$('rotationAxis').value=d.rotationAxis;$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;$('buildCommit').textContent=d.buildCommit;$('buildDate').textContent=d.buildDate;$('releaseChannel').textContent=d.releaseChannel.toUpperCase();$('hardwareTarget').textContent=d.board+' / '+d.chip;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';$('otaChannel').value=d.otaChannel;syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
+async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value,otaChannel:$('otaChannel').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();}
 async function setMode(mode){const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+mode,{method:'POST'});msg(await r.text());refresh();}
 async function calibrate(){msg('Calibrating — keep bike stationary...');const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());refresh();}
+async function runOrientationWizard(){if(!confirm('Park securely and run the mounting wizard now? The controller will enter STANDBY. Follow the OLED prompts: upright first, then lean side to side.'))return;msg('Wizard running — follow the OLED prompts on the bike...');try{const r=await fetch('/api/orientation?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());settingsLoaded=false;axisLoaded=false;refresh();refreshSsid()}catch(e){msg('Wizard connection failed — check the controller display')}}
 async function refreshSsid(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();$('apSsid').textContent=d.ssid;if(!axisLoaded){$('rotationAxis').value=d.rotationAxis;axisLoaded=true;}if(!advancedLoaded){$('wheeliePattern').value=d.wheeliePattern;$('warningPattern').value=d.warningPattern;$('warningBrightness').value=d.warningBrightness;$('warningBrightnessOut').textContent=d.warningBrightness+'%';$('warningAngleFirmware').value=d.warningAngle;$('warningResetFirmware').value=d.warningReset;$('warningRateFirmware').value=d.warningRate;advancedLoaded=true;}}catch(e){}}
 async function testOutput(level){const r=await fetch('/api/output?token='+encodeURIComponent(token)+'&level='+level,{method:'POST'});msg(await r.text());refresh();}
 async function saveWifiPassword(){const p=$('wifiPassword').value;if(p.length<8||p.length>63){msg('Wi-Fi password must be 8-63 characters');return;}if(!confirm('Change Wi-Fi password? You will need to reconnect.'))return;const body=new URLSearchParams({password:p});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());$('wifiPassword').value='';}catch(e){msg('Password saved; reconnect to the controller AP');}}
-function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
+async function generateWifiPassword(){if(!confirm('Generate a unique 16-character password for this controller? Copy it before reconnecting.'))return;const body=new URLSearchParams({generate:'1'});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}),text=await r.text();alert(text);msg('Password generated; reconnect to the controller AP')}catch(e){msg('Password generated; reconnect and use the password shown')}}
+function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware','otaChannel'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
 $('settingsFile').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());if(data.format!=='wheelie-controller-settings'||!data.controller)throw new Error('Unsupported settings file');Object.entries(data.controller).forEach(([id,value])=>{if($(id))$(id).value=value});if(data.appearance)Object.entries(data.appearance).forEach(([key,value])=>{if(value!==null)localStorage.setItem(key,value)});$('brightnessOut').textContent=$('brightness').value+'%';$('fadeOut').textContent=$('fade').value+' ms';$('warningBrightnessOut').textContent=$('warningBrightness').value+'%';if(confirm('Settings loaded. Apply them to the controller now?'))await saveSettings();else msg('Settings loaded for review; use Save Settings to apply')}catch(err){msg('Import failed: '+err.message)}e.target.value=''});
 async function rollbackFirmware(){if(!confirm('Reboot into the previous firmware image?'))return;try{const r=await fetch('/api/rollback?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text())}catch(e){msg('Controller is rebooting or rollback failed')}}
-async function uploadFirmware(){const f=$('firmwareFile').files[0];if(!f){msg('Choose firmware.bin first');return;}if(!confirm('Upload '+f.name+' and reboot the controller?'))return;const form=new FormData();form.append('update',f,f.name);msg('Uploading firmware — do not remove power...');try{const r=await fetch('/api/update?token='+encodeURIComponent(token),{method:'POST',body:form});msg(await r.text());}catch(e){msg('Controller rebooting — reconnect shortly');}}
+async function uploadFirmware(){const f=$('firmwareFile').files[0];if(!f){msg('Choose a signed .wctrl package first');return;}if(!f.name.toLowerCase().endsWith('.wctrl')){msg('Unsigned .bin files are not accepted');return;}if(!confirm('Verify and install '+f.name+'?'))return;const form=new FormData();form.append('update',f,f.name);msg('Verifying signed firmware — do not remove power...');try{const r=await fetch('/api/update?token='+encodeURIComponent(token),{method:'POST',body:form});msg(await r.text());}catch(e){msg('Controller rebooting — reconnect shortly');}}
 refresh();refreshSsid();setInterval(refresh,500);setInterval(refreshSsid,5000);
 </script></body></html>
 )rawliteral";
@@ -1503,6 +1803,8 @@ void handleStatus() {
     String json = "{";
     json += "\"pitch\":" + String(currentTriggerPitch, 2);
     json += ",\"rawPitch\":" + String(currentAbsolutePitch, 2);
+    json += ",\"roll\":" + String(currentRollAngle, 2);
+    json += ",\"rollRate\":" + String(currentRollRate, 2);
     json += ",\"baseline\":" + String(adaptiveBaseline, 2);
     json += ",\"gyroRate\":" + String(currentGyroRate, 2);
     json += ",\"gLoad\":" + String(currentGLoad, 3);
@@ -1533,6 +1835,9 @@ void handleStatus() {
         rotationAxis == RotationAxis::X ? "x" :
         (rotationAxis == RotationAxis::Z ? "z" : "y")
     ) + "\"";
+    json += ",\"rollAxis\":\"" + String(getAxisJsonName(rollAxis)) + "\"";
+    json += ",\"verticalAxis\":\"" + String(getAxisJsonName(verticalAxis)) + "\"";
+    json += ",\"orientationConfigured\":" + String(orientationConfigured ? "true" : "false");
     json += ",\"adaptiveTau\":" + String(settings.adaptiveTimeConstantSec, 1);
     json += ",\"freezeRate\":" + String(settings.adaptiveFreezeRateDegSec, 1);
     json += ",\"trigger\":" + String(settings.triggerAngle, 1);
@@ -1549,6 +1854,13 @@ void handleStatus() {
     json += ",\"clients\":" + String(accessPointEnabled ? WiFi.softAPgetStationNum() : 0);
     json += ",\"uptime\":" + String(millis() / 1000);
     json += ",\"firmware\":\"" + String(FIRMWARE_VERSION) + "\"";
+    json += ",\"board\":\"" + String(TARGET_BOARD_ID) + "\"";
+    json += ",\"chip\":\"" + String(TARGET_CHIP_ID) + "\"";
+    json += ",\"buildCommit\":\"" + String(BUILD_COMMIT) + "\"";
+    json += ",\"buildDate\":\"" + String(BUILD_DATE) + "\"";
+    json += ",\"releaseChannel\":\"" + String(RELEASE_CHANNEL) + "\"";
+    json += ",\"otaChannel\":\"" + otaChannel + "\"";
+    json += ",\"signedOta\":true";
     json += ",\"calOneGRaw\":" + String(calibrationRestMagnitudeRaw, 4);
     json += ",\"calAccelRms\":" + String(calibrationAccelNoiseRms, 4);
     json += ",\"calGyroRms\":" + String(calibrationGyroNoiseRms, 2);
@@ -1565,7 +1877,8 @@ void handleSettings() {
     const char* required[] = {
         "angleMode", "rotationAxis", "adaptiveTau", "freezeRate", "trigger", "reset",
         "hold", "minon", "brightness", "fade", "bootMode", "wheeliePattern",
-        "warningPattern", "warningBrightness", "warningAngle", "warningReset", "warningRate"
+        "warningPattern", "warningBrightness", "warningAngle", "warningReset", "warningRate",
+        "otaChannel"
     };
 
     for (const char* key : required) {
@@ -1592,6 +1905,7 @@ void handleSettings() {
     float newWarningAngle = server.arg("warningAngle").toFloat();
     float newWarningReset = server.arg("warningReset").toFloat();
     float newWarningRate = server.arg("warningRate").toFloat();
+    String newOtaChannel = server.arg("otaChannel");
 
     if (angleMode != "absolute" && angleMode != "adaptive") {
         server.send(400, "text/plain", "Invalid angle mode");
@@ -1600,6 +1914,10 @@ void handleSettings() {
 
     if (newRotationAxis != "x" && newRotationAxis != "y" && newRotationAxis != "z") {
         server.send(400, "text/plain", "Invalid rotation axis");
+        return;
+    }
+    if (newRotationAxis != getAxisJsonName(rotationAxis)) {
+        server.send(409, "text/plain", "Use the mounting wizard to change sensor orientation");
         return;
     }
 
@@ -1647,6 +1965,10 @@ void handleSettings() {
         server.send(400, "text/plain", "Invalid boot mode");
         return;
     }
+    if (newOtaChannel != "stable" && newOtaChannel != "testing") {
+        server.send(400, "text/plain", "OTA channel must be stable or testing");
+        return;
+    }
 
     if (newWheeliePattern < 0 || newWheeliePattern > 4 ||
         newWarningPattern < 0 || newWarningPattern > 4) {
@@ -1661,10 +1983,6 @@ void handleSettings() {
         return;
     }
 
-    RotationAxis selectedRotationAxis = newRotationAxis == "x" ? RotationAxis::X :
-        (newRotationAxis == "z" ? RotationAxis::Z : RotationAxis::Y);
-    bool rotationAxisChanged = selectedRotationAxis != rotationAxis;
-    rotationAxis = selectedRotationAxis;
     settings.angleMode = angleMode == "adaptive" ? AngleMode::ADAPTIVE : AngleMode::ABSOLUTE;
     settings.adaptiveTimeConstantSec = newAdaptiveTau;
     settings.adaptiveFreezeRateDegSec = newFreezeRate;
@@ -1681,22 +1999,17 @@ void handleSettings() {
     settings.warningAngle = newWarningAngle;
     settings.warningResetAngle = newWarningReset;
     settings.warningPitchRateDegSec = newWarningRate;
+    otaChannel = newOtaChannel;
 
     controllerState = ControllerState::NORMAL;
     forceOutputOff();
     resetAdaptiveBaselineToCurrent();
     saveSettings();
 
-    if (rotationAxisChanged) {
-        setOperatingMode(OperatingMode::STANDBY);
-        imuHealthy = false;
-    }
-
     oled.clearDisplay();
     displayDirty = true;
-    server.send(200, "text/plain", rotationAxisChanged ?
-        "Settings saved. Rotation axis changed; recalibrate before arming." :
-        "Settings saved");
+    rotateWriteToken();
+    server.send(200, "text/plain", "Settings saved");
 }
 
 void handleMode() {
@@ -1805,12 +2118,13 @@ void handlePeakReset() {
 void handleWiFiPassword() {
     if (!requireWriteToken()) return;
 
-    if (!server.hasArg("password")) {
+    const bool generatePassword = server.hasArg("generate") && server.arg("generate") == "1";
+    if (!generatePassword && !server.hasArg("password")) {
         server.send(400, "text/plain", "Missing password");
         return;
     }
 
-    String newPassword = server.arg("password");
+    String newPassword = generatePassword ? generateUniqueWiFiPassword() : server.arg("password");
     if (newPassword.length() < 8 || newPassword.length() > 63) {
         server.send(400, "text/plain", "Wi-Fi password must be 8-63 characters");
         return;
@@ -1823,29 +2137,281 @@ void handleWiFiPassword() {
 
     wifiApPassword = newPassword;
     saveSettings();
+    rotateWriteToken();
 
     if (accessPointEnabled) {
         scheduleAccessPointRestart(1200);
-        server.send(200, "text/plain", "Password saved. Access point restarting — reconnect with the new password.");
+        server.send(200, "text/plain", generatePassword ?
+            String("Generated device password: ") + newPassword +
+                "\nCopy it now. The access point is restarting." :
+            "Password saved. Access point restarting — reconnect with the new password.");
     } else {
-        server.send(200, "text/plain", "Password saved. It will be used next time the AP is enabled.");
+        server.send(200, "text/plain", generatePassword ?
+            String("Generated device password: ") + newPassword +
+                "\nCopy it now. It will be used when the AP is enabled." :
+            "Password saved. It will be used next time the AP is enabled.");
     }
 }
 
-void handleFirmwareUpdateFinished() {
-    if (!validWriteToken()) {
-        server.send(403, "text/plain", "Invalid write token");
-        return;
+void resetFirmwareUploadState() {
+    if (firmwareUpload.hashInitialized) {
+        mbedtls_sha256_free(&firmwareUpload.hashContext);
+    }
+    if (firmwareUpload.updateStarted && Update.isRunning()) {
+        Update.abort();
+    }
+    firmwareUpload = FirmwareUploadState{};
+}
+
+void failFirmwareUpload(const String& reason) {
+    if (firmwareUpload.failed) return;
+    firmwareUpload.failed = true;
+    firmwareUpload.error = reason;
+    if (firmwareUpload.updateStarted && Update.isRunning()) {
+        Update.abort();
+    }
+    firmwareUpload.updateStarted = false;
+    if (firmwareUpload.hashInitialized) {
+        mbedtls_sha256_free(&firmwareUpload.hashContext);
+        firmwareUpload.hashInitialized = false;
+    }
+    Serial.printf("OTA rejected: %s\n", reason.c_str());
+}
+
+String firmwareManifestValue(const char* key) {
+    const String manifest(firmwareUpload.manifest);
+    const String prefix = String(key) + "=";
+    int start = manifest.indexOf(prefix);
+    while (start >= 0 && start > 0 && manifest[start - 1] != '\n') {
+        start = manifest.indexOf(prefix, start + 1);
+    }
+    if (start < 0) return "";
+    start += prefix.length();
+    int end = manifest.indexOf('\n', start);
+    if (end < 0) return "";
+    return manifest.substring(start, end);
+}
+
+bool isLowerHexSha256(const String& value) {
+    if (value.length() != 64) return false;
+    for (size_t index = 0; index < value.length(); ++index) {
+        const char character = value[index];
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f'))) return false;
+    }
+    return true;
+}
+
+String digestToHex(const uint8_t digest[32]) {
+    static constexpr char hexadecimal[] = "0123456789abcdef";
+    char output[65];
+    for (size_t index = 0; index < 32; ++index) {
+        output[index * 2] = hexadecimal[digest[index] >> 4];
+        output[index * 2 + 1] = hexadecimal[digest[index] & 0x0F];
+    }
+    output[64] = '\0';
+    return String(output);
+}
+
+bool verifyFirmwareManifestSignature() {
+    uint8_t digest[32];
+    mbedtls_sha256_context manifestHash;
+    mbedtls_sha256_init(&manifestHash);
+    if (mbedtls_sha256_starts(&manifestHash, 0) != 0 ||
+        mbedtls_sha256_update(
+            &manifestHash,
+            reinterpret_cast<const uint8_t*>(firmwareUpload.manifest),
+            firmwareUpload.manifestExpected) != 0 ||
+        mbedtls_sha256_finish(&manifestHash, digest) != 0) {
+        mbedtls_sha256_free(&manifestHash);
+        return false;
+    }
+    mbedtls_sha256_free(&manifestHash);
+
+    mbedtls_pk_context publicKey;
+    mbedtls_pk_init(&publicKey);
+    const int parseResult = mbedtls_pk_parse_public_key(
+        &publicKey,
+        reinterpret_cast<const uint8_t*>(FIRMWARE_SIGNING_PUBLIC_KEY_PEM),
+        sizeof(FIRMWARE_SIGNING_PUBLIC_KEY_PEM));
+    const int verifyResult = parseResult == 0 ? mbedtls_pk_verify(
+        &publicKey,
+        MBEDTLS_MD_SHA256,
+        digest,
+        sizeof(digest),
+        firmwareUpload.signature,
+        firmwareUpload.signatureExpected) : parseResult;
+    mbedtls_pk_free(&publicKey);
+    return verifyResult == 0;
+}
+
+bool prepareFirmwarePayload() {
+    firmwareUpload.manifest[firmwareUpload.manifestExpected] = '\0';
+    if (!verifyFirmwareManifestSignature()) {
+        failFirmwareUpload("Manifest signature is invalid");
+        return false;
     }
 
-    bool success = !Update.hasError();
-    server.sendHeader("Connection", "close");
-    server.send(
-        success ? 200 : 500,
-        "text/plain",
-        success ? "Firmware update complete. Rebooting..." : "Firmware update failed"
-    );
+    const String format = firmwareManifestValue("format");
+    const String board = firmwareManifestValue("board");
+    const String chip = firmwareManifestValue("chip");
+    firmwareUpload.packageVersion = firmwareManifestValue("version");
+    const String channel = firmwareManifestValue("channel");
+    firmwareUpload.packageCommit = firmwareManifestValue("commit");
+    firmwareUpload.packageBuilt = firmwareManifestValue("built");
+    const String size = firmwareManifestValue("size");
+    firmwareUpload.expectedSha256 = firmwareManifestValue("sha256");
 
+    if (format != "1") {
+        failFirmwareUpload("Unsupported package format");
+        return false;
+    }
+    if (!isFirmwareMetadataCompatible(
+            board.c_str(), channel.c_str(), TARGET_BOARD_ID, otaChannel.c_str()) ||
+        chip != TARGET_CHIP_ID) {
+        failFirmwareUpload(
+            String("Package requires board ") + board + " / " + chip +
+            " on " + channel + " channel; this device is " + TARGET_BOARD_ID +
+            " / " + TARGET_CHIP_ID + " on " + otaChannel);
+        return false;
+    }
+    if ((uint32_t)size.toInt() != firmwareUpload.firmwareExpected ||
+        !isLowerHexSha256(firmwareUpload.expectedSha256) ||
+        firmwareUpload.packageVersion.length() == 0 ||
+        firmwareUpload.packageCommit.length() == 0 ||
+        firmwareUpload.packageBuilt.length() == 0) {
+        failFirmwareUpload("Signed manifest metadata is incomplete or inconsistent");
+        return false;
+    }
+    if (!Update.begin(firmwareUpload.firmwareExpected)) {
+        Update.printError(Serial);
+        failFirmwareUpload("Unable to reserve the OTA partition");
+        return false;
+    }
+    firmwareUpload.updateStarted = true;
+    mbedtls_sha256_init(&firmwareUpload.hashContext);
+    firmwareUpload.hashInitialized = true;
+    if (mbedtls_sha256_starts(&firmwareUpload.hashContext, 0) != 0) {
+        failFirmwareUpload("Unable to initialize firmware SHA-256");
+        return false;
+    }
+    return true;
+}
+
+void parseFirmwarePackageHeader() {
+    if (!hasFirmwarePackageMagic(
+            firmwareUpload.header, firmwareUpload.headerReceived)) {
+        failFirmwareUpload("Unsigned .bin files are not accepted; choose a signed .wctrl package");
+        return;
+    }
+    firmwareUpload.manifestExpected = readLittleEndian16(firmwareUpload.header + 8);
+    firmwareUpload.signatureExpected = readLittleEndian16(firmwareUpload.header + 10);
+    firmwareUpload.firmwareExpected = readLittleEndian32(firmwareUpload.header + 12);
+    if (firmwareUpload.manifestExpected == 0 ||
+        firmwareUpload.manifestExpected > FIRMWARE_MANIFEST_MAX_SIZE ||
+        firmwareUpload.signatureExpected == 0 ||
+        firmwareUpload.signatureExpected > FIRMWARE_SIGNATURE_MAX_SIZE ||
+        firmwareUpload.firmwareExpected == 0) {
+        failFirmwareUpload("Signed package header is invalid");
+    }
+}
+
+void processFirmwarePackageBytes(uint8_t* data, size_t size) {
+    size_t offset = 0;
+    while (offset < size && !firmwareUpload.failed) {
+        if (firmwareUpload.headerReceived < FIRMWARE_PACKAGE_HEADER_SIZE) {
+            const size_t count = min(
+                size - offset,
+                FIRMWARE_PACKAGE_HEADER_SIZE - firmwareUpload.headerReceived);
+            memcpy(firmwareUpload.header + firmwareUpload.headerReceived, data + offset, count);
+            firmwareUpload.headerReceived += count;
+            offset += count;
+            if (firmwareUpload.headerReceived == FIRMWARE_PACKAGE_HEADER_SIZE) {
+                parseFirmwarePackageHeader();
+            }
+            continue;
+        }
+        if (firmwareUpload.manifestReceived < firmwareUpload.manifestExpected) {
+            const size_t count = min(
+                size - offset,
+                firmwareUpload.manifestExpected - firmwareUpload.manifestReceived);
+            memcpy(firmwareUpload.manifest + firmwareUpload.manifestReceived, data + offset, count);
+            firmwareUpload.manifestReceived += count;
+            offset += count;
+            continue;
+        }
+        if (firmwareUpload.signatureReceived < firmwareUpload.signatureExpected) {
+            const size_t count = min(
+                size - offset,
+                firmwareUpload.signatureExpected - firmwareUpload.signatureReceived);
+            memcpy(firmwareUpload.signature + firmwareUpload.signatureReceived, data + offset, count);
+            firmwareUpload.signatureReceived += count;
+            offset += count;
+            if (firmwareUpload.signatureReceived == firmwareUpload.signatureExpected &&
+                !prepareFirmwarePayload()) return;
+            continue;
+        }
+        if (firmwareUpload.firmwareReceived < firmwareUpload.firmwareExpected) {
+            const size_t count = min(
+                size - offset,
+                (size_t)(firmwareUpload.firmwareExpected - firmwareUpload.firmwareReceived));
+            if (mbedtls_sha256_update(&firmwareUpload.hashContext, data + offset, count) != 0 ||
+                Update.write(data + offset, count) != count) {
+                Update.printError(Serial);
+                failFirmwareUpload("Firmware write failed");
+                return;
+            }
+            firmwareUpload.firmwareReceived += count;
+            offset += count;
+            continue;
+        }
+        failFirmwareUpload("Signed package contains unexpected trailing data");
+    }
+}
+
+void finishFirmwarePackage() {
+    if (firmwareUpload.failed) return;
+    if (!firmwareUpload.updateStarted ||
+        firmwareUpload.firmwareReceived != firmwareUpload.firmwareExpected) {
+        failFirmwareUpload("Signed package ended before the complete firmware image arrived");
+        return;
+    }
+    uint8_t digest[32];
+    if (mbedtls_sha256_finish(&firmwareUpload.hashContext, digest) != 0) {
+        failFirmwareUpload("Unable to finish firmware SHA-256");
+        return;
+    }
+    mbedtls_sha256_free(&firmwareUpload.hashContext);
+    firmwareUpload.hashInitialized = false;
+    if (digestToHex(digest) != firmwareUpload.expectedSha256) {
+        failFirmwareUpload("Firmware SHA-256 does not match the signed manifest");
+        return;
+    }
+    if (!Update.end(false)) {
+        Update.printError(Serial);
+        failFirmwareUpload("Firmware image validation failed");
+        return;
+    }
+    firmwareUpload.updateStarted = false;
+    firmwareUpload.complete = true;
+    Serial.printf(
+        "Signed OTA verified: %s %s commit %s (%u bytes)\n",
+        otaChannel.c_str(), firmwareUpload.packageVersion.c_str(),
+        firmwareUpload.packageCommit.c_str(), firmwareUpload.firmwareReceived);
+}
+
+void handleFirmwareUpdateFinished() {
+    const bool success = firmwareUpload.authorized && firmwareUpload.complete &&
+        !firmwareUpload.failed;
+    const int status = firmwareUpload.rateLimited ? 429 :
+        (!firmwareUpload.authorized ? 403 : (success ? 200 : 400));
+    const String response = success ?
+        String("Signed firmware ") + firmwareUpload.packageVersion +
+            " verified. Rebooting..." :
+        (firmwareUpload.error.length() > 0 ? firmwareUpload.error : "Firmware update failed");
+    if (firmwareUpload.rateLimited) server.sendHeader("Retry-After", "30");
+    server.sendHeader("Connection", "close");
+    server.send(status, "text/plain", response);
     if (success) {
         delay(400);
         ESP.restart();
@@ -1853,34 +2419,58 @@ void handleFirmwareUpdateFinished() {
 }
 
 void handleFirmwareUpload() {
-    if (!validWriteToken()) {
-        return;
-    }
-
     HTTPUpload& upload = server.upload();
-
     if (upload.status == UPLOAD_FILE_START) {
-        Serial.printf("OTA upload: %s\n", upload.filename.c_str());
+        resetFirmwareUploadState();
+        firmwareUpload.rateLimited = !consumeWriteRequestLimit();
+        firmwareUpload.authorized = !firmwareUpload.rateLimited && validWriteToken();
+        if (!firmwareUpload.authorized) {
+            firmwareUpload.error = firmwareUpload.rateLimited ?
+                "Too many write requests — retry in 30 seconds" : "Invalid write token";
+            return;
+        }
+        Serial.printf("Signed OTA upload: %s\n", upload.filename.c_str());
         setOperatingMode(OperatingMode::STANDBY);
         forceOutputOff();
-
-        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
-            Update.printError(Serial);
-        }
+    } else if (!firmwareUpload.authorized) {
+        return;
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-            Update.printError(Serial);
-        }
+        processFirmwarePackageBytes(upload.buf, upload.currentSize);
     } else if (upload.status == UPLOAD_FILE_END) {
-        if (!Update.end(true)) {
-            Update.printError(Serial);
-        } else {
-            Serial.printf("OTA complete: %u bytes\n", upload.totalSize);
-        }
+        finishFirmwarePackage();
     } else if (upload.status == UPLOAD_FILE_ABORTED) {
-        Update.end();
-        Serial.println("OTA upload aborted");
+        failFirmwareUpload("Firmware upload aborted");
     }
+}
+
+void handleOrientationWizard() {
+    if (!requireWriteToken()) return;
+
+    setOperatingMode(OperatingMode::STANDBY);
+    forceOutputOff();
+    const bool orientationSuccess = runOrientationWizard();
+    bool calibrationSuccess = false;
+
+    if (orientationSuccess) {
+        for (uint8_t seconds = INITIAL_CALIBRATION_DELAY_SECONDS; seconds > 0; --seconds) {
+            char countdown[17];
+            snprintf(countdown, sizeof(countdown), "Starting in %u...", seconds);
+            drawCalibrationScreen(countdown);
+            delay(1000);
+        }
+        calibrationSuccess = calibrateMPU();
+    }
+
+    setOperatingMode(OperatingMode::STANDBY);
+    lastMicros = micros();
+    if (orientationSuccess) server.sendHeader("X-Write-Token", writeToken);
+    server.send(
+        orientationSuccess && calibrationSuccess ? 200 : 500,
+        "text/plain",
+        !orientationSuccess ? "Orientation not detected — previous setup preserved" :
+        (calibrationSuccess ? "Orientation saved and calibrated; controller left in STANDBY" :
+         "Orientation saved, but calibration failed — controller left in STANDBY")
+    );
 }
 
 void handleFirmwareRollback() {
@@ -1927,6 +2517,7 @@ void registerWebRoutes() {
     server.on("/api/settings", HTTP_POST, handleSettings);
     server.on("/api/mode", HTTP_POST, handleMode);
     server.on("/api/calibrate", HTTP_POST, handleCalibration);
+    server.on("/api/orientation", HTTP_POST, handleOrientationWizard);
     server.on("/api/output", HTTP_POST, handleManualOutput);
     server.on("/api/peak/reset", HTTP_POST, handlePeakReset);
     server.on("/api/wifi", HTTP_POST, handleWiFiPassword);
@@ -2133,16 +2724,23 @@ bool updateIMUAndPitch(float& dt) {
     currentGLoad += (instantaneousLinearG - currentGLoad) * gAlpha;
     if (currentGLoad < GLOAD_DEADBAND_G) currentGLoad = 0.0f;
 
-    float accelPitch = calculateAccelPitch(data);
+    float accelPitch = calculateAccelAngleRelative(rotationAxis, data);
     float gyroRate = getSelectedGyroRate(data) - gyroAxisBias;
+    float accelRoll = calculateAccelAngleRelative(rollAxis, data);
+    float rollRate = getGyroRateForAxis(data, rollAxis) - rollGyroBias;
 
     currentGyroRate = PITCH_SIGN * gyroRate;
+    currentRollRate = rollRate;
 
     pitch =
         FILTER_ALPHA * (pitch + gyroRate * dt) +
         (1.0f - FILTER_ALPHA) * accelPitch;
+    roll =
+        FILTER_ALPHA * (roll + rollRate * dt) +
+        (1.0f - FILTER_ALPHA) * accelRoll;
 
     currentAbsolutePitch = PITCH_SIGN * (pitch - pitchZero);
+    currentRollAngle = roll - rollZero;
 
     if (currentGLoad > highestGLoad) highestGLoad = currentGLoad;
     return true;
@@ -2193,6 +2791,8 @@ void setup() {
     Serial.println("Motorcycle Wheelie Controller");
     Serial.print("Firmware ");
     Serial.println(FIRMWARE_VERSION);
+    Serial.printf("Build %s at %s (%s channel)\n", BUILD_COMMIT, BUILD_DATE, RELEASE_CHANNEL);
+    Serial.printf("Target %s / %s\n", TARGET_BOARD_ID, TARGET_CHIP_ID);
     Serial.println("Dynamic +G + Peaks + Wi-Fi Recovery + Robust Discovery");
     Serial.println("--------------------------------");
 
@@ -2203,6 +2803,7 @@ void setup() {
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     loadSettings();
+    Serial.printf("Accepted OTA channel: %s\n", otaChannel.c_str());
     writeToken = makeWriteToken();
 
     // OLED initializes the shared I2C bus. Do not add Wire.begin().
@@ -2224,6 +2825,17 @@ void setup() {
     writeMPURegister(CONFIG_REG, 0x03);   // ~44/42 Hz internal DLPF
     writeMPURegister(ACCEL_CONFIG, ACCEL_RANGE_CONFIG_VALUE); // +/-4g
     writeMPURegister(GYRO_CONFIG, 0x00);  // ±250 deg/s
+
+    if (!orientationConfigured) {
+        Serial.println("No saved mounting orientation; starting first-setup wizard.");
+        if (!runOrientationWizard()) {
+            Serial.println("Using safe default axes until the wizard is completed in Settings.");
+        }
+    } else {
+        Serial.printf("Saved orientation: vertical=%s roll=%s pitch=%s\n",
+                      getAxisName(verticalAxis), getAxisName(rollAxis),
+                      getAxisName(rotationAxis));
+    }
 
     Serial.printf("Initial calibration begins in %u seconds; level the bike now.\n",
                   INITIAL_CALIBRATION_DELAY_SECONDS);

@@ -7,7 +7,7 @@
 [![Firmware CI](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/cronular/motorcycle-wheelie-lighting-controller?display_name=tag)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/releases/latest)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-XIAO_ESP32--S3-orange)](https://platformio.org/)
-[![Tests](https://img.shields.io/badge/native_tests-14-brightgreen)](#test-without-hardware)
+[![Tests](https://img.shields.io/badge/native_tests-27-brightgreen)](#test-without-hardware)
 [![Live simulator](https://img.shields.io/badge/try-live_simulator-48e0d0)](https://cronular.github.io/motorcycle-wheelie-lighting-controller/)
 
 </div>
@@ -27,7 +27,9 @@ dashboard.
 - Configurable trigger hold, minimum-on time, brightness, fades, and patterns.
 - High-angle and pitch-rate warning behavior with safe IMU-failure shutdown.
 - SSD1306 status pages and physical-button gesture controls.
+- First-run mounting wizard with persistent pitch/roll axis detection.
 - Local Wi-Fi dashboard, captive portal, OTA update, and rollback support.
+- Signed, board-locked OTA packages with stable and testing channels.
 - Desktop simulator and native regression tests—no connected board required.
 - Automated GitHub builds with downloadable firmware artifacts and releases.
 
@@ -64,7 +66,30 @@ pio test -e native
 PlatformIO provisions the project-local Windows compiler automatically. The
 suite executes the same portable helpers used by the firmware and covers state
 transitions, timing, hysteresis, rollover, adaptive tracking, warnings, patterns,
-fades, validation, and complete wheelie profiles.
+fades, mounting-axis detection, OTA compatibility, write throttling, validation,
+and complete wheelie profiles. Signed-package tests additionally exercise valid,
+tampered-firmware, and tampered-manifest cases.
+
+## Secure OTA updates
+
+Dashboard OTA accepts signed `.wctrl` packages—not raw `.bin` files. Before an
+update partition is activated, the device verifies:
+
+- the ECDSA P-256 manifest signature;
+- the streamed firmware SHA-256 and signed byte count;
+- `seeed_xiao_esp32s3` / `esp32s3` hardware compatibility;
+- the device's selected `stable` or `testing` channel.
+
+`main` publishes the rolling `ota-stable` release and `testing` publishes
+`ota-testing`. Tagged `v*` releases must come from `main`, must match the embedded
+firmware version, and publish a signed OTA package plus a detached signature for
+the release checksum file. Raw factory images are retained for wired recovery.
+The Settings page selects the accepted OTA channel and shows build commit, build
+date, compiled release channel, and hardware target.
+
+The trusted public key and key-rotation procedure are documented in
+[security/README.md](security/README.md). The private key must only be stored in
+the `FIRMWARE_SIGNING_KEY_PEM` Actions secret or an encrypted offline backup.
 
 ## Interactive simulator
 
@@ -85,8 +110,9 @@ The current `main` version is also hosted as a
 - `main` is the current releasable firmware.
 - `testing` is the integration branch for firmware and simulator changes.
 - Pull requests flow from `testing` into `main` after CI passes.
-- Version tags publish a verified OTA `firmware.bin`, SHA-256 checksums, and a
-  combined factory image when the selected PlatformIO release produces one.
+- Branch pushes refresh signed `ota-stable` or `ota-testing` channel packages.
+- Version tags publish signed `.wctrl` OTA packages, signed SHA-256 checksums,
+  and a combined factory image when the PlatformIO build produces one.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete workflow and
 [CHANGELOG.md](CHANGELOG.md) for release history.
