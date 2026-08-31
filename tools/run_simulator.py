@@ -4,18 +4,102 @@ from argparse import ArgumentParser
 from functools import partial
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
+import re
 import threading
+import urllib.parse
 import urllib.request
 import webbrowser
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SIMULATOR_DIR = PROJECT_DIR / "simulator"
+FIRMWARE_SOURCE = PROJECT_DIR / "src" / "main.cpp"
 
 
-class QuietHandler(SimpleHTTPRequestHandler):
+PHONE_BRIDGE = r"""
+<script>
+(() => {
+  const nativeFetch = window.fetch.bind(window);
+  async function bridge() {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      if (window.parent !== window && window.parent.wheelieSimulatorApi) {
+        return window.parent.wheelieSimulatorApi;
+      }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    throw new Error('Simulator bridge unavailable');
+  }
+  window.fetch = async (input, options = {}) => {
+    const raw = typeof input === 'string' ? input : input.url;
+    const url = new URL(raw, window.location.href);
+    if (!url.pathname.startsWith('/api/')) return nativeFetch(input, options);
+    const api = await bridge();
+    const result = await api.request(url.pathname + url.search, {
+      method: options.method || (input && input.method) || 'GET',
+      body: options.body || null
+    });
+    return new Response(result.body || '', {
+      status: result.status || 200,
+      headers: {'Content-Type': result.contentType || 'text/plain'}
+    });
+  };
+  window.addEventListener('DOMContentLoaded', async () => {
+    try {
+      const api = await bridge();
+      api.phoneReady(window.location.pathname);
+    } catch (error) {}
+  });
+})();
+</script>
+"""
+
+
+def embedded_html(name: str) -> str:
+    source = FIRMWARE_SOURCE.read_text(encoding="utf-8")
+    match = re.search(
+        rf'const char {re.escape(name)}\[\] PROGMEM = R"rawliteral\((.*?)\)rawliteral";',
+        source,
+        re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError(f"Could not extract {name} from {FIRMWARE_SOURCE}")
+    return match.group(1)
+
+
+def phone_page(name: str) -> bytes:
+    page = embedded_html(name).replace("</head>", PHONE_BRIDGE + "</head>")
+    if name == "DASHBOARD_HTML":
+        page = page.replace('href="/settings"', 'href="/phone/settings"')
+    else:
+        page = page.replace('href="/"', 'href="/phone/"')
+    return page.encode("utf-8")
+
+
+PHONE_DASHBOARD = phone_page("DASHBOARD_HTML")
+PHONE_SETTINGS = phone_page("SETTINGS_HTML")
+
+
+class SimulatorHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
+
+    def send_phone_page(self, body: bytes):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/phone", "/phone/"):
+            self.send_phone_page(PHONE_DASHBOARD)
+            return
+        if path in ("/phone/settings", "/phone/settings/"):
+            self.send_phone_page(PHONE_SETTINGS)
+            return
+        super().do_GET()
 
 
 def main():
@@ -29,8 +113,12 @@ def main():
     missing = [name for name in required if not (SIMULATOR_DIR / name).is_file()]
     if missing:
         raise SystemExit("Missing simulator files: " + ", ".join(missing))
+    simulator_script = (SIMULATOR_DIR / "simulator.js").read_text(encoding="utf-8")
+    bridge_markers = ("wheelieSimulatorApi", "phoneStatusSnapshot", '"/api/settings"')
+    if any(marker not in simulator_script for marker in bridge_markers):
+        raise SystemExit("Simulator phone API bridge is incomplete")
 
-    handler = partial(QuietHandler, directory=str(SIMULATOR_DIR))
+    handler = partial(SimulatorHandler, directory=str(SIMULATOR_DIR))
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     url = f"http://127.0.0.1:{args.port}/"
 
@@ -39,8 +127,19 @@ def main():
         worker.start()
         with urllib.request.urlopen(url, timeout=3) as response:
             body = response.read().decode("utf-8")
-            if response.status != 200 or "Wheelie Controller Lab" not in body:
+            if response.status != 200 or "Wheelie Controller Lab" not in body or 'src="/phone/"' not in body:
                 raise SystemExit("Simulator HTTP smoke test failed")
+        with urllib.request.urlopen(url + "phone/", timeout=3) as response:
+            body = response.read().decode("utf-8")
+            if (response.status != 200 or "wheelieSimulatorApi" not in body or
+                    '/phone/settings' not in body or "Rider HUD" not in body or
+                    'id="leanGauge"' not in body):
+                raise SystemExit("Phone dashboard bridge smoke test failed")
+        with urllib.request.urlopen(url + "phone/settings", timeout=3) as response:
+            body = response.read().decode("utf-8")
+            if (response.status != 200 or "Controller Settings" not in body or
+                    'href="/phone/"' not in body or 'id="leanGaugeSetting"' not in body):
+                raise SystemExit("Phone settings bridge smoke test failed")
         server.shutdown()
         print("Simulator smoke test passed")
         return

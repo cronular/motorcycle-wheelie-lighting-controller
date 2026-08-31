@@ -3,6 +3,7 @@
 #endif
 #include <unity.h>
 #include "controller_core.h"
+#include "ride_log_format.h"
 
 void setUp() {}
 void tearDown() {}
@@ -290,6 +291,32 @@ void test_write_rate_limit_handles_millis_rollover() {
         buckets, 1, 9, nearRollover + 30001, 1, 10000, 30000));
 }
 
+void test_ride_log_storage_budget() {
+    TEST_ASSERT_EQUAL_UINT16(5, RIDE_LOG_SAMPLE_RATE_HZ);
+    TEST_ASSERT_EQUAL_UINT32(90UL * 60UL * 1000UL, RIDE_LOG_MAX_DURATION_MS);
+    TEST_ASSERT_EQUAL_UINT32(27000, RIDE_LOG_MAX_SAMPLES);
+    TEST_ASSERT_EQUAL_UINT32(432192, RIDE_LOG_MAX_FILE_BYTES);
+    TEST_ASSERT_TRUE(RIDE_LOG_MAX_SESSIONS * RIDE_LOG_MAX_FILE_BYTES <=
+                     0x180000 - 256 * 1024);
+}
+
+void test_ride_log_compact_record_layout() {
+    TEST_ASSERT_EQUAL_UINT32(192, sizeof(RideLogHeader));
+    TEST_ASSERT_EQUAL_UINT32(16, sizeof(RideTelemetrySample));
+    TEST_ASSERT_EQUAL_UINT8(3, RIDE_LOG_MAX_SESSIONS);
+}
+
+void test_ride_log_header_validation_and_opt_in_default() {
+    TEST_ASSERT_FALSE(RIDE_LOG_DEFAULT_ENABLED);
+    RideLogHeader header;
+    TEST_ASSERT_FALSE(isRideLogHeaderValid(header));
+    header.sampleSize = sizeof(RideTelemetrySample);
+    header.sessionId = 1;
+    TEST_ASSERT_TRUE(isRideLogHeaderValid(header));
+    header.sampleRateHz = 10;
+    TEST_ASSERT_FALSE(isRideLogHeaderValid(header));
+}
+
 static void runAllTests() {
     RUN_TEST(test_trigger_hold);
     RUN_TEST(test_pending_cancellation);
@@ -318,6 +345,9 @@ static void runAllTests() {
     RUN_TEST(test_write_rate_limit_is_per_client);
     RUN_TEST(test_write_rate_limit_recovers_after_block);
     RUN_TEST(test_write_rate_limit_handles_millis_rollover);
+    RUN_TEST(test_ride_log_storage_budget);
+    RUN_TEST(test_ride_log_compact_record_layout);
+    RUN_TEST(test_ride_log_header_validation_and_opt_in_default);
 }
 
 #ifdef ARDUINO

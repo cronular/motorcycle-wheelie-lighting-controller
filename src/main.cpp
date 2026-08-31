@@ -13,8 +13,10 @@
 #include <ESPmDNS.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <Update.h>
 #include "controller_core.h"
+#include "ride_log_format.h"
 #include "firmware_signing_key.h"
 #include "build_metadata.generated.h"
 
@@ -33,7 +35,7 @@
 // FIRMWARE
 // =====================================================
 
-constexpr const char* FIRMWARE_VERSION = "v0.12.0-testing";
+constexpr const char* FIRMWARE_VERSION = "v0.13.0-testing";
 constexpr const char* TARGET_BOARD_ID = "seeed_xiao_esp32s3";
 constexpr const char* TARGET_CHIP_ID = "esp32s3";
 
@@ -334,6 +336,23 @@ DisplayPage displayPage = DisplayPage::STATUS;
 bool displayDirty = true;
 
 // =====================================================
+// BOUNDED RIDE TELEMETRY
+// =====================================================
+
+bool rideStorageReady = false;
+bool rideLoggingEnabled = RIDE_LOG_DEFAULT_ENABLED;
+bool rideSessionActive = false;
+bool rideHashInitialized = false;
+File rideFile;
+RideLogHeader activeRideHeader;
+mbedtls_sha256_context rideHashContext;
+uint8_t activeRideSlot = 0;
+uint32_t rideSessionStartMs = 0;
+uint32_t rideNextSampleMs = 0;
+uint32_t rideWheelieStartCount = 0;
+uint16_t rideSamplesSinceFlush = 0;
+
+// =====================================================
 // FORWARD DECLARATIONS
 // =====================================================
 
@@ -349,6 +368,10 @@ void toggleAccessPointFromButton();
 void scheduleAccessPointRestart(unsigned long delayMs = 750);
 void resetWiFiPasswordToDefault();
 void flashCalibrationComplete();
+void initializeRideLogging();
+void startRideSession();
+void finishRideSession(bool capacityReached = false);
+void updateRideLogging();
 
 // =====================================================
 // STRING HELPERS
@@ -435,6 +458,7 @@ void loadSettings() {
     wifiApPassword = preferences.getString("wifipass", DEFAULT_WIFI_AP_PASSWORD);
     wifiApSsid = preferences.getString("apssid", "");
     otaChannel = preferences.getString("otachannel", RELEASE_CHANNEL);
+    rideLoggingEnabled = preferences.getBool("ridelog", RIDE_LOG_DEFAULT_ENABLED);
 
     preferences.end();
 
@@ -498,6 +522,7 @@ void saveSettings() {
     preferences.putBool("orientok", orientationConfigured);
     preferences.putString("wifipass", wifiApPassword);
     preferences.putString("otachannel", otaChannel);
+    preferences.putBool("ridelog", rideLoggingEnabled);
 
     preferences.end();
     Serial.println("Settings saved to NVS");
@@ -1238,10 +1263,265 @@ void updateAngleProcessing(float dt) {
 }
 
 // =====================================================
+// RIDE TELEMETRY STORAGE
+// =====================================================
+
+String ridePathForSlot(uint8_t slot) {
+    return "/ride" + String(slot) + ".wlr";
+}
+
+int16_t rideCentiValue(float value) {
+    value = max(-327.68f, min(327.67f, value));
+    return static_cast<int16_t>(lroundf(value * 100.0f));
+}
+
+int16_t rideMilliGValue(float value) {
+    value = max(-32.768f, min(32.767f, value));
+    return static_cast<int16_t>(lroundf(value * 1000.0f));
+}
+
+void copyRideText(char* destination, size_t size, const char* value) {
+    if (size == 0) return;
+    strncpy(destination, value ? value : "", size - 1);
+    destination[size - 1] = '\0';
+}
+
+bool readRideHeader(uint8_t slot, RideLogHeader& header) {
+    if (!rideStorageReady || slot >= RIDE_LOG_MAX_SESSIONS) return false;
+    File file = LittleFS.open(ridePathForSlot(slot), "r");
+    if (!file) return false;
+    const bool readOk = file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) == sizeof(header);
+    file.close();
+    return readOk && isRideLogHeaderValid(header);
+}
+
+void writeActiveRideHeader() {
+    if (!rideSessionActive || !rideFile) return;
+    activeRideHeader.durationMs = millis() - rideSessionStartMs;
+    activeRideHeader.wheelieCount = completedWheelieCount - rideWheelieStartCount;
+    const size_t endPosition = rideFile.size();
+    if (rideFile.seek(0)) {
+        rideFile.write(reinterpret_cast<const uint8_t*>(&activeRideHeader), sizeof(activeRideHeader));
+        rideFile.flush();
+        rideFile.seek(endPosition);
+    }
+}
+
+void recoverRideFile(uint8_t slot) {
+    const String path = ridePathForSlot(slot);
+    File file = LittleFS.open(path, "r+");
+    if (!file) return;
+
+    RideLogHeader header;
+    if (file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header) ||
+        !isRideLogHeaderValid(header)) {
+        file.close();
+        Serial.printf("Ignoring invalid ride log %s\n", path.c_str());
+        return;
+    }
+
+    const size_t availableSamples = file.size() > sizeof(header) ?
+        (file.size() - sizeof(header)) / sizeof(RideTelemetrySample) : 0;
+    if ((header.flags & RIDE_HEADER_COMPLETE) && header.sampleCount <= availableSamples) {
+        file.close();
+        return;
+    }
+
+    header.sampleCount = 0;
+    header.durationMs = 0;
+    header.wheelieCount = 0;
+    header.peakPitchCentiDeg = 0;
+    header.peakRollCentiDeg = 0;
+    header.peakGyroCentiDegSec = 0;
+    header.peakGMillig = 0;
+
+    mbedtls_sha256_context recoveryHash;
+    mbedtls_sha256_init(&recoveryHash);
+    mbedtls_sha256_starts(&recoveryHash, 0);
+    file.seek(sizeof(header));
+    RideTelemetrySample sample;
+    bool priorWheelie = false;
+    while (header.sampleCount < availableSamples &&
+           file.read(reinterpret_cast<uint8_t*>(&sample), sizeof(sample)) == sizeof(sample)) {
+        mbedtls_sha256_update(&recoveryHash,
+            reinterpret_cast<const uint8_t*>(&sample), sizeof(sample));
+        header.sampleCount++;
+        header.durationMs = sample.elapsedMs;
+        header.peakPitchCentiDeg = max(header.peakPitchCentiDeg, sample.pitchCentiDeg);
+        const int16_t absoluteRoll = static_cast<int16_t>(abs(static_cast<int>(sample.rollCentiDeg)));
+        const int16_t absoluteGyro = static_cast<int16_t>(abs(static_cast<int>(sample.gyroCentiDegSec)));
+        const uint16_t positiveG = static_cast<uint16_t>(max(0, static_cast<int>(sample.gLoadMillig)));
+        header.peakRollCentiDeg = max(header.peakRollCentiDeg, absoluteRoll);
+        header.peakGyroCentiDegSec = max(header.peakGyroCentiDegSec, absoluteGyro);
+        header.peakGMillig = max(header.peakGMillig, positiveG);
+        const bool wheelie = sample.flags & RIDE_SAMPLE_WHEELIE;
+        if (wheelie && !priorWheelie) header.wheelieCount++;
+        priorWheelie = wheelie;
+    }
+    mbedtls_sha256_finish(&recoveryHash, header.sampleSha256);
+    mbedtls_sha256_free(&recoveryHash);
+    header.flags |= RIDE_HEADER_COMPLETE | RIDE_HEADER_RECOVERED;
+
+    file.seek(0);
+    file.write(reinterpret_cast<const uint8_t*>(&header), sizeof(header));
+    file.flush();
+    file.close();
+    Serial.printf("Recovered ride session %lu with %lu samples\n",
+                  (unsigned long)header.sessionId, (unsigned long)header.sampleCount);
+}
+
+void initializeRideLogging() {
+    rideStorageReady = LittleFS.begin(true);
+    if (!rideStorageReady) {
+        Serial.println("Ride telemetry storage unavailable");
+        return;
+    }
+    for (uint8_t slot = 0; slot < RIDE_LOG_MAX_SESSIONS; ++slot) {
+        recoverRideFile(slot);
+    }
+    Serial.printf("Ride telemetry ready: %lu / %lu bytes used, %u sessions max\n",
+                  (unsigned long)LittleFS.usedBytes(), (unsigned long)LittleFS.totalBytes(),
+                  RIDE_LOG_MAX_SESSIONS);
+}
+
+void startRideSession() {
+    if (!rideLoggingEnabled || !rideStorageReady || rideSessionActive) return;
+
+    preferences.begin("wheelie", false);
+    uint32_t sessionId = preferences.getUInt("rideid", 0) + 1;
+    if (sessionId == 0) sessionId = 1;
+    preferences.putUInt("rideid", sessionId);
+    preferences.end();
+
+    activeRideSlot = static_cast<uint8_t>((sessionId - 1) % RIDE_LOG_MAX_SESSIONS);
+    const String path = ridePathForSlot(activeRideSlot);
+    if (LittleFS.exists(path)) LittleFS.remove(path);
+    rideFile = LittleFS.open(path, "w+");
+    if (!rideFile) {
+        Serial.println("Unable to create ride telemetry session");
+        return;
+    }
+
+    activeRideHeader = RideLogHeader{};
+    activeRideHeader.headerSize = sizeof(RideLogHeader);
+    activeRideHeader.sampleSize = sizeof(RideTelemetrySample);
+    activeRideHeader.sessionId = sessionId;
+    activeRideHeader.startUptimeMs = millis();
+    activeRideHeader.rotationAxis = static_cast<uint8_t>(rotationAxis);
+    activeRideHeader.rollAxis = static_cast<uint8_t>(rollAxis);
+    activeRideHeader.verticalAxis = static_cast<uint8_t>(verticalAxis);
+    copyRideText(activeRideHeader.firmware, sizeof(activeRideHeader.firmware), FIRMWARE_VERSION);
+    copyRideText(activeRideHeader.commit, sizeof(activeRideHeader.commit), BUILD_COMMIT);
+    copyRideText(activeRideHeader.buildDate, sizeof(activeRideHeader.buildDate), BUILD_DATE);
+    copyRideText(activeRideHeader.channel, sizeof(activeRideHeader.channel), RELEASE_CHANNEL);
+    copyRideText(activeRideHeader.board, sizeof(activeRideHeader.board), TARGET_BOARD_ID);
+    if (rideFile.write(reinterpret_cast<const uint8_t*>(&activeRideHeader),
+                       sizeof(activeRideHeader)) != sizeof(activeRideHeader)) {
+        rideFile.close();
+        LittleFS.remove(path);
+        Serial.println("Unable to write ride telemetry header");
+        return;
+    }
+    rideFile.flush();
+
+    mbedtls_sha256_init(&rideHashContext);
+    if (mbedtls_sha256_starts(&rideHashContext, 0) != 0) {
+        mbedtls_sha256_free(&rideHashContext);
+        rideFile.close();
+        LittleFS.remove(path);
+        Serial.println("Unable to initialize ride checksum");
+        return;
+    }
+    rideHashInitialized = true;
+    rideSessionActive = true;
+    rideSessionStartMs = millis();
+    rideNextSampleMs = rideSessionStartMs;
+    rideWheelieStartCount = completedWheelieCount;
+    rideSamplesSinceFlush = 0;
+    Serial.printf("Ride session %lu started in slot %u\n",
+                  (unsigned long)sessionId, activeRideSlot);
+}
+
+void finishRideSession(bool capacityReached) {
+    if (!rideSessionActive) return;
+    activeRideHeader.durationMs = millis() - rideSessionStartMs;
+    activeRideHeader.wheelieCount = completedWheelieCount - rideWheelieStartCount;
+    activeRideHeader.flags |= RIDE_HEADER_COMPLETE;
+    if (capacityReached) activeRideHeader.flags |= RIDE_HEADER_CAPACITY_REACHED;
+    if (rideHashInitialized) {
+        mbedtls_sha256_finish(&rideHashContext, activeRideHeader.sampleSha256);
+        mbedtls_sha256_free(&rideHashContext);
+        rideHashInitialized = false;
+    }
+    writeActiveRideHeader();
+    rideFile.close();
+    rideSessionActive = false;
+    Serial.printf("Ride session %lu saved: %lu samples, %lu ms%s\n",
+                  (unsigned long)activeRideHeader.sessionId,
+                  (unsigned long)activeRideHeader.sampleCount,
+                  (unsigned long)activeRideHeader.durationMs,
+                  capacityReached ? " (capacity reached)" : "");
+}
+
+void updateRideLogging() {
+    if (!rideSessionActive || !rideFile) return;
+    const uint32_t now = millis();
+    if (static_cast<int32_t>(now - rideNextSampleMs) < 0) return;
+    rideNextSampleMs += RIDE_LOG_SAMPLE_INTERVAL_MS;
+    if (static_cast<int32_t>(now - rideNextSampleMs) >
+        static_cast<int32_t>(RIDE_LOG_SAMPLE_INTERVAL_MS * 2)) {
+        rideNextSampleMs = now + RIDE_LOG_SAMPLE_INTERVAL_MS;
+    }
+    if (activeRideHeader.sampleCount >= RIDE_LOG_MAX_SAMPLES) {
+        finishRideSession(true);
+        return;
+    }
+
+    RideTelemetrySample sample;
+    sample.elapsedMs = now - rideSessionStartMs;
+    sample.pitchCentiDeg = rideCentiValue(currentTriggerPitch);
+    sample.rawPitchCentiDeg = rideCentiValue(currentAbsolutePitch);
+    sample.rollCentiDeg = rideCentiValue(currentRollAngle);
+    sample.gyroCentiDegSec = rideCentiValue(currentGyroRate);
+    sample.gLoadMillig = rideMilliGValue(currentGLoad);
+    sample.outputPercent = static_cast<uint8_t>((outputBrightness * 100U) / 255U);
+    if (imuHealthy) sample.flags |= RIDE_SAMPLE_IMU_OK;
+    if (controllerState == ControllerState::TRIGGER_PENDING) sample.flags |= RIDE_SAMPLE_PENDING;
+    if (controllerState == ControllerState::WHEELIE) sample.flags |= RIDE_SAMPLE_WHEELIE;
+    if (highAngleWarningActive) sample.flags |= RIDE_SAMPLE_WARNING;
+    if (adaptiveBaselineFrozen) sample.flags |= RIDE_SAMPLE_BASELINE_FROZEN;
+
+    if (rideFile.write(reinterpret_cast<const uint8_t*>(&sample), sizeof(sample)) != sizeof(sample)) {
+        finishRideSession(true);
+        return;
+    }
+    mbedtls_sha256_update(&rideHashContext,
+        reinterpret_cast<const uint8_t*>(&sample), sizeof(sample));
+    activeRideHeader.sampleCount++;
+    activeRideHeader.durationMs = sample.elapsedMs;
+    activeRideHeader.peakPitchCentiDeg = max(activeRideHeader.peakPitchCentiDeg, sample.pitchCentiDeg);
+    const int16_t absoluteRoll = static_cast<int16_t>(abs(static_cast<int>(sample.rollCentiDeg)));
+    const int16_t absoluteGyro = static_cast<int16_t>(abs(static_cast<int>(sample.gyroCentiDegSec)));
+    const uint16_t positiveG = static_cast<uint16_t>(max(0, static_cast<int>(sample.gLoadMillig)));
+    activeRideHeader.peakRollCentiDeg = max(activeRideHeader.peakRollCentiDeg, absoluteRoll);
+    activeRideHeader.peakGyroCentiDegSec = max(activeRideHeader.peakGyroCentiDegSec, absoluteGyro);
+    activeRideHeader.peakGMillig = max(activeRideHeader.peakGMillig, positiveG);
+
+    if (++rideSamplesSinceFlush >= RIDE_LOG_SAMPLE_RATE_HZ * 5) {
+        rideSamplesSinceFlush = 0;
+        writeActiveRideHeader();
+    }
+}
+
+// =====================================================
 // OPERATING MODE
 // =====================================================
 
 void setOperatingMode(OperatingMode mode) {
+    const OperatingMode previousMode = operatingMode;
+    if (previousMode == OperatingMode::ARMED && mode != OperatingMode::ARMED) {
+        finishRideSession();
+    }
     operatingMode = mode;
     controllerState = ControllerState::NORMAL;
     triggerStartTime = 0;
@@ -1253,6 +1533,7 @@ void setOperatingMode(OperatingMode mode) {
         // In adaptive mode, arming establishes the current road attitude
         // as the initial adaptive reference.
         resetAdaptiveBaselineToCurrent();
+        if (previousMode != OperatingMode::ARMED) startRideSession();
     }
 
     oled.clearDisplay();
@@ -1599,6 +1880,15 @@ body[data-theme="light"] .instrumentCard{background:linear-gradient(180deg,#fff,
 .fullscreenView .top,.fullscreenView .viewSwitch,.fullscreenView .foot{display:none}.fullscreenView .wrap{width:100%;max-width:none;padding:0}.fullscreenView .grid{display:block}.fullscreenView .dashboardCard{display:none}.fullscreenView .dashboardCard.fullscreenActive{display:block;min-height:100svh;border:0;border-radius:0;padding:calc(8px + env(safe-area-inset-top,0px)) calc(8px + env(safe-area-inset-right,0px)) calc(8px + env(safe-area-inset-bottom,0px)) calc(8px + env(safe-area-inset-left,0px))}.fullscreenView .fullscreenActive .fullExit{display:block}.fullscreenView .instrumentCard .telemetry{display:none}.fullscreenView .instrumentCard .bikeStage{height:calc(100svh - 16px - env(safe-area-inset-top,0px) - env(safe-area-inset-bottom,0px));margin:0;border-radius:14px}.fullscreenView .side{overflow:auto}.fullscreenView .side h2{padding-right:52px}.fullscreenView .side .rideGraph{height:clamp(160px,28svh,280px)}
 .fullscreenView .instrumentCard.fullscreenActive{padding:8px}.fullscreenView .instrumentCard .bikeStage{height:calc(100svh - 16px)}
 body[data-theme="light"] .viewSwitch{background:rgba(255,255,255,.8)}body[data-theme="light"] .viewBtn.active{background:#fff}
+.safetyStrip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin:0 0 10px}.safetyChip{min-width:0;padding:9px 10px;border:1px solid var(--line);border-radius:12px;background:rgba(10,16,24,.82)}.safetyChip span{display:block;color:var(--muted);font-size:9px;text-transform:uppercase;letter-spacing:.1em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.safetyChip strong{display:block;margin-top:4px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.safetyChip.modeArmed strong,.safetyChip.connected strong,.safetyChip.recording strong{color:var(--green)}.safetyChip.modeStandby strong,.safetyChip.loggingReady strong{color:var(--yellow)}.safetyChip.disconnected strong{color:var(--red)}.staleBanner{display:none;margin:-2px 0 10px;padding:9px 12px;border:1px solid #713545;border-radius:11px;background:#3d1c25;color:#ffabb7;font-size:12px;font-weight:750;text-align:center}.staleBanner.active{display:block}.warningRibbon{display:none;position:absolute;z-index:6;left:50%;top:8px;transform:translateX(-50%);padding:7px 12px;border:1px solid var(--red);border-radius:999px;background:rgba(78,19,29,.92);color:#ffbac3;font-size:11px;font-weight:900;letter-spacing:.09em;white-space:nowrap}.warningRibbon.on{display:block}.thresholdMarker{position:absolute;z-index:3;left:50px;right:108px;border-top:1px dashed;pointer-events:none;opacity:.8}.thresholdMarker span{position:absolute;left:4px;bottom:3px;font-size:8px;font-weight:800;letter-spacing:.08em}.thresholdMarker.trigger{color:var(--blue)}.thresholdMarker.warning{color:var(--red)}.leanGauge{position:absolute;z-index:5;left:42%;bottom:8px;width:min(160px,42%);transform:translateX(-50%);padding:6px 9px;border:1px solid var(--line);border-radius:10px;background:rgba(8,13,20,.82);backdrop-filter:blur(4px)}.leanHead{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:8px;text-transform:uppercase;letter-spacing:.08em}.leanHead strong{color:var(--text);font-size:10px}.leanTrack{position:relative;height:6px;margin-top:5px;border-radius:999px;background:#192536}.leanTrack:after{content:"";position:absolute;left:50%;top:-2px;bottom:-2px;border-left:1px solid var(--muted)}.leanDot{position:absolute;left:50%;top:50%;width:10px;height:10px;border:2px solid #081019;border-radius:50%;background:var(--cyan);box-shadow:0 0 8px rgba(85,230,255,.65);transform:translate(-50%,-50%)}.utilityActions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.utilityBtn{min-height:44px;border:1px solid var(--line);border-radius:11px;background:#172131;color:var(--text);font:inherit;font-size:12px;font-weight:750;cursor:pointer}.graphHead{display:flex;align-items:end;justify-content:space-between;gap:10px;margin-top:13px}.graphHead strong{font-size:12px}.graphLegend{display:flex;gap:9px;color:var(--muted);font-size:9px}.graphLegend i{display:inline-block;width:12px;margin-right:3px;border-top:2px solid var(--cyan);vertical-align:middle}.graphLegend .triggerLine{border-color:var(--blue);border-top-style:dashed}.graphLegend .warningLine{border-color:var(--red);border-top-style:dashed}.diagnosticDetails{margin-top:10px;border:1px solid var(--line);border-radius:11px;background:#0a1018}.diagnosticDetails summary{min-height:44px;padding:13px;color:var(--muted);font-size:11px;font-weight:750;cursor:pointer}.diagnosticDetails .angleFlow{padding:0 10px 11px;margin:0}.lastRideCard{margin-top:10px;padding:11px;border:1px solid var(--line);border-radius:12px;background:#0a1018}.lastRideTop{display:flex;align-items:center;justify-content:space-between;gap:8px}.lastRideCard h3{margin:0;font-size:12px}.lastRideMeta{margin-top:5px;color:var(--muted);font-size:10px;line-height:1.4}.lastRideActions{display:flex;gap:7px;margin-top:9px}.lastRideActions button{min-height:44px;padding:0 13px;border:1px solid var(--line);border-radius:10px;background:#172131;color:var(--text);font:inherit;font-size:11px;font-weight:750}.peak{padding-right:55px}.peakReset,.fullExit,.rideExit{width:44px;height:44px}.peakReset{right:6px}.modeControl{min-height:86px}.modeControl:after{height:4px}.foot{line-height:1.4}
+body[data-theme="sunlight"]{color-scheme:light;--bg:#fff;--panel:#fff;--panel2:#eef2f6;--line:#111827;--text:#05070a;--muted:#374151;--blue:#005fcc;--violet:#5432c7;--cyan:#006f82;--green:#006b3c;--yellow:#8a5700;--red:#b40020;background:#fff}body[data-theme="sunlight"] .card,body[data-theme="sunlight"] .instrumentCard{background:#fff;box-shadow:none;border-width:2px}body[data-theme="sunlight"] .instrumentCard .bikeStage{background:#f7fafc;border-width:2px}body[data-theme="sunlight"] .safetyChip,body[data-theme="sunlight"] .viewSwitch,body[data-theme="sunlight"] .stat,body[data-theme="sunlight"] .peak,body[data-theme="sunlight"] .lastRideCard,body[data-theme="sunlight"] .diagnosticDetails,body[data-theme="sunlight"] .eventStat{background:#fff}body[data-theme="sunlight"] .instrumentReadout,body[data-theme="sunlight"] .leanGauge{background:rgba(255,255,255,.96)}body[data-theme="sunlight"] .viewBtn.active{background:#dce7f2}body[data-theme="sunlight"] .bar,body[data-theme="sunlight"] .rideGraph{background:#f1f5f9}
+body[data-theme="light"] .safetyChip,body[data-theme="light"] .stat,body[data-theme="light"] .lastRideCard,body[data-theme="light"] .diagnosticDetails,body[data-theme="light"] .eventStat{background:#f7faff}body[data-theme="light"] .leanGauge{background:rgba(247,250,253,.92)}body[data-theme="light"] .utilityBtn,body[data-theme="light"] .lastRideActions button{background:#e8f0f8;color:var(--text)}
+@media(max-width:520px){.brand p{display:none}.top{margin-bottom:9px}.safetyStrip{gap:5px}.safetyChip{padding:8px 7px}.safetyChip strong{font-size:12px}.viewSwitch{margin-bottom:9px}.foot{display:none}.thresholdMarker{right:103px}.instrumentCard .bikeStage{height:clamp(255px,71vw,292px)}.instrumentCard .telemetry{margin-top:8px}.leanGauge{left:40%;width:43%}}
+@media(max-width:360px){.safetyChip span{font-size:8px}.safetyChip strong{font-size:11px}.leanGauge{display:none}.thresholdMarker{right:98px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{scroll-behavior:auto!important;transition:none!important;animation:none!important}.bikeStage.effectFlash:before{opacity:.52}}
+.thresholdMarker span{top:3px;bottom:auto}
+.warningRibbon{left:50px;right:108px;transform:none;text-align:center}
+.safetyModeControl{position:relative;overflow:hidden;color:var(--text);font:inherit;text-align:left;cursor:pointer}.safetyModeControl:after{content:"";position:absolute;left:0;bottom:0;width:var(--hold-progress,0%);height:4px;background:linear-gradient(90deg,var(--blue),var(--cyan));box-shadow:0 0 10px var(--blue)}.safetyModeControl.holding{border-color:var(--blue);box-shadow:0 0 0 2px rgba(76,166,255,.14)}.safetyModeControl[disabled]{cursor:wait;opacity:.65}
 </style>
 </head>
 <body>
@@ -1617,16 +1907,27 @@ body[data-theme="light"] .viewSwitch{background:rgba(255,255,255,.8)}body[data-t
     </div>
   </header>
 
+  <div class="safetyStrip" aria-label="Controller safety status">
+    <button class="safetyChip safetyModeControl modeStandby" id="quickModeChip" type="button" aria-label="Press and hold to change armed state"><span>Controller</span><strong id="quickMode">STANDBY</strong></button>
+    <div class="safetyChip connected" id="quickConnectionChip"><span>Connection</span><strong id="quickConnection">LIVE</strong></div>
+    <div class="safetyChip"><span>Light output</span><strong id="quickOutput">0%</strong></div>
+    <div class="safetyChip" id="quickLogChip"><span>Ride logging</span><strong id="quickLog">OFF</strong></div>
+  </div>
+  <div class="staleBanner" id="staleBanner" role="alert">Telemetry paused — showing the last received values</div>
+
   <nav class="viewSwitch" aria-label="Dashboard view">
-    <button class="viewBtn active" id="controllerViewBtn" type="button">Wheelie controller</button>
-    <button class="viewBtn" id="telemetryViewBtn" type="button">Live telemetry</button>
+    <button class="viewBtn active" id="controllerViewBtn" type="button">Rider HUD</button>
+    <button class="viewBtn" id="telemetryViewBtn" type="button">Telemetry</button>
   </nav>
 
   <main class="grid">
     <section class="card attitude instrumentCard dashboardCard activeView" id="controllerCard">
       <div class="bikeStage" id="bikeStage">
         <button class="fullExit" id="controllerExit" type="button" aria-label="Exit full screen">×</button>
-        <div class="instrumentGrid"></div><div class="horizon"><span>LEVEL</span></div>
+        <div class="warningRibbon" id="warningRibbon" role="status">⚠ HIGH-ANGLE WARNING</div>
+        <div class="thresholdMarker warning" id="warningMarker"><span>WARNING</span></div>
+        <div class="thresholdMarker trigger" id="triggerMarker"><span>TRIGGER</span></div>
+        <div class="instrumentGrid"></div><div class="horizon" id="hudHorizon"><span>LEVEL</span></div>
         <div class="pitchScale" aria-hidden="true"><div class="pitchTape" id="pitchTape"><span class="pitchTick major" style="--tick:60">60°</span><span class="pitchTick" style="--tick:50">50°</span><span class="pitchTick major" style="--tick:40">40°</span><span class="pitchTick" style="--tick:30">30°</span><span class="pitchTick major" style="--tick:20">20°</span><span class="pitchTick" style="--tick:10">10°</span><span class="pitchTick major" style="--tick:0">0°</span><span class="pitchTick" style="--tick:-10">−10°</span><span class="pitchTick major" style="--tick:-20">−20°</span><span class="pitchTick" style="--tick:-30">−30°</span><span class="pitchTick major" style="--tick:-40">−40°</span><span class="pitchTick" style="--tick:-50">−50°</span><span class="pitchTick major" style="--tick:-60">−60°</span></div></div>
         <div class="instrumentReadouts">
           <div class="instrumentReadout"><div class="eyebrow">Wheelie pitch</div><div class="bigPitch" id="pitch">0.0°</div><div class="pitchLabel" id="angleModeLine">ABSOLUTE mode</div></div>
@@ -1644,6 +1945,7 @@ body[data-theme="light"] .viewSwitch{background:rgba(255,255,255,.8)}body[data-t
             <path class="metal" d="M310 84 L337 62 L370 73"/>
           </svg>
         </div>
+        <div class="leanGauge" id="leanGauge"><div class="leanHead"><span>Lean</span><strong id="leanHud">0.0°</strong></div><div class="leanTrack"><i class="leanDot" id="leanDot"></i></div></div>
       </div>
 
       <div class="telemetry">
@@ -1657,42 +1959,48 @@ body[data-theme="light"] .viewSwitch{background:rgba(255,255,255,.8)}body[data-t
       <button class="fullExit" id="telemetryExit" type="button" aria-label="Exit full screen">×</button>
       <h2>Live telemetry</h2>
       <div class="stats">
-        <button class="stat modeControl" id="modeControl" type="button" aria-label="Tap to toggle armed state; hold five seconds to recalibrate"><span>Controller</span><strong id="mode">---</strong><span class="modeHint" id="modeHint">Tap to arm</span></button>
+        <button class="stat modeControl" id="modeControl" type="button" aria-label="Press and hold to change armed state"><span>Controller</span><strong id="mode">---</strong><span class="modeHint" id="modeHint">Hold to arm</span></button>
         <div class="stat"><span>Output</span><strong id="output">0%</strong></div>
         <div class="stat"><span>IMU</span><strong id="imu">---</strong></div>
         <div class="stat"><span>Baseline</span><strong id="baselineState">---</strong></div>
+        <div class="stat"><span>Lean angle</span><strong id="rollValue">0.0°</strong></div>
+        <div class="stat"><span>Roll rate</span><strong id="rollRateValue">0.0°/s</strong></div>
       </div>
+      <div class="utilityActions"><button class="utilityBtn" id="calibrateButton" type="button">Recalibrate level</button><a class="utilityBtn" href="/settings" style="display:grid;place-items:center;text-decoration:none">Settings</a></div>
 
       <div class="peakGrid">
-        <div class="peak"><span>Highest angle</span><strong id="peakAngle">0.0°</strong><button class="peakReset" onclick="resetPeak('angle')" title="Reset highest angle">↺</button></div>
-        <div class="peak"><span>Highest +G</span><strong id="peakG">+0.00 g</strong><button class="peakReset" onclick="resetPeak('g')" title="Reset highest G load">↺</button></div>
+        <div class="peak"><span>Highest angle</span><strong id="peakAngle">0.0°</strong><button class="peakReset" onclick="resetPeak('angle')" title="Reset highest angle" aria-label="Reset highest angle">↺</button></div>
+        <div class="peak"><span>Highest +G</span><strong id="peakG">+0.00 g</strong><button class="peakReset" onclick="resetPeak('g')" title="Reset highest G load" aria-label="Reset highest G load">↺</button></div>
       </div>
 
       <div class="meter"><div class="meterHead"><span>Pitch rate / selected gyro</span><strong id="gyro">0.0°/s</strong></div><div class="bar centerBar"><div class="gyroFill" id="gyroFill"></div></div></div>
       <div class="meter"><div class="meterHead"><span>+G load</span><strong id="gload">+0.00 g</strong></div><div class="bar"><div class="barFill" id="gFill"></div></div></div>
       <div class="meter"><div class="meterHead"><span>Trigger threshold</span><strong id="threshold">20.0°</strong></div><div class="bar"><div class="barFill" id="pitchFill"></div></div></div>
 
-      <div class="angleFlow">
+      <div class="eventStats"><div class="eventStat"><span>Wheelies this session</span><strong id="eventCount">0</strong></div><div class="eventStat"><span>Current duration</span><strong id="activeDuration">0.0 s</strong></div><div class="eventStat"><span>Last duration</span><strong id="lastDuration">0.0 s</strong></div><div class="eventStat"><span>Last peak</span><strong id="lastEventPeak">0.0° · +0.00 g</strong></div></div>
+      <div class="graphHead"><strong>Recent pitch · 30 seconds</strong><div class="graphLegend"><span><i></i>Pitch</span><span><i class="triggerLine"></i>Trigger</span><span><i class="warningLine"></i>Warning</span></div></div>
+      <canvas class="rideGraph" id="rideGraph" aria-label="Recent pitch history with trigger and warning thresholds"></canvas>
+      <details class="diagnosticDetails"><summary>Angle-processing diagnostics</summary><div class="angleFlow">
         <div class="angleBox"><small>RAW</small><strong id="raw2">0.0°</strong></div><div class="arrow">−</div>
         <div class="angleBox"><small>BASE</small><strong id="base2">0.0°</strong></div><div class="arrow">=</div>
         <div class="angleBox"><small>TRIGGER</small><strong id="trig2">0.0°</strong></div>
-      </div>
-      <canvas class="rideGraph" id="rideGraph" aria-label="Recent pitch history"></canvas>
-      <div class="eventStats"><div class="eventStat"><span>Wheelies this session</span><strong id="eventCount">0</strong></div><div class="eventStat"><span>Current duration</span><strong id="activeDuration">0.0 s</strong></div><div class="eventStat"><span>Last duration</span><strong id="lastDuration">0.0 s</strong></div><div class="eventStat"><span>Last peak</span><strong id="lastEventPeak">0.0° · +0.00 g</strong></div></div>
+      </div></details>
+      <div class="lastRideCard" id="lastRideCard"><div class="lastRideTop"><h3>Ride reports</h3><strong id="rideStorageSummary">Logging off</strong></div><div class="lastRideMeta" id="lastRideMeta">Enable ride logging in Settings to create hardware-recorded reports.</div><div class="lastRideActions" id="lastRideActions" hidden></div></div>
     </section>
   </main>
   <div class="foot">1× display · 2× angle mode · 3× Wi-Fi AP · hold armed/standby · 30 s hold resets Wi-Fi password</div>
 </div>
 <script>
-let token='';const $=id=>document.getElementById(id);const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+let token='',refreshBusy=false,lastStatusAt=0,lastGraphAt=0;const $=id=>document.getElementById(id);const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));const setText=(id,value)=>{const node=$(id);if(node&&node.textContent!==String(value))node.textContent=value};
 const plusG=v=>'+'+Math.max(0,v).toFixed(2)+' g';
 function gyroBar(v){v=clamp(v,-120,120);if(v>=0){$('gyroFill').style.left='50%';$('gyroFill').style.width=(v/120*50)+'%';}else{$('gyroFill').style.left=(50+v/120*50)+'%';$('gyroFill').style.width=(-v/120*50)+'%';}}
 const saved=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};
 const persist=(key,value)=>{try{localStorage.setItem(key,value)}catch(e){}};
-function setTheme(theme){document.body.dataset.theme=theme;persist('wheelieTheme',theme);$('themeIcon').innerHTML=theme==='light'?'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>':'<path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/>';}
+function setTheme(theme){if(!['dark','light','sunlight'].includes(theme))theme='dark';document.body.dataset.theme=theme;persist('wheelieTheme',theme);$('themeBtn').title=theme==='dark'?'Switch to day theme':theme==='light'?'Switch to sunlight theme':'Switch to night theme';$('themeIcon').innerHTML=theme==='dark'?'<path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/>':theme==='light'?'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>':'<path d="M3 12h18M12 3v18"/><circle cx="12" cy="12" r="7"/>';}
 function shade(hex,amount){const n=parseInt(hex.slice(1),16),c=v=>Math.max(0,Math.min(255,v+amount)).toString(16).padStart(2,'0');return '#'+c(n>>16)+c((n>>8)&255)+c(n&255)}
 function setBikeColor(color){$('bikeColorA').setAttribute('stop-color',shade(color,25));$('bikeColorB').setAttribute('stop-color',shade(color,-45));$('frameColorA').setAttribute('stop-color',shade(color,55));$('frameColorB').setAttribute('stop-color',shade(color,-15))}
 function setPitchTape(enabled){document.body.classList.toggle('tapeEnabled',enabled);document.body.classList.toggle('tapeDisabled',!enabled)}
+function setLeanGauge(enabled){$('leanGauge').hidden=!enabled}
 let activeDashboardView=saved('wheelieDashboardView','controller');
 function setDashboardView(view){activeDashboardView=view==='telemetry'?'telemetry':'controller';persist('wheelieDashboardView',activeDashboardView);$('controllerCard').classList.toggle('activeView',activeDashboardView==='controller');$('telemetryCard').classList.toggle('activeView',activeDashboardView==='telemetry');$('controllerViewBtn').classList.toggle('active',activeDashboardView==='controller');$('telemetryViewBtn').classList.toggle('active',activeDashboardView==='telemetry');}
 function activeDashboardCard(){return $(activeDashboardView==='telemetry'?'telemetryCard':'controllerCard')}
@@ -1700,27 +2008,29 @@ function setFullscreen(enabled){const card=activeDashboardCard();document.body.c
 $('controllerViewBtn').addEventListener('click',()=>setDashboardView('controller'));$('telemetryViewBtn').addEventListener('click',()=>setDashboardView('telemetry'));$('rideBtn').addEventListener('click',()=>setFullscreen(true));$('controllerExit').addEventListener('click',()=>setFullscreen(false));$('telemetryExit').addEventListener('click',()=>setFullscreen(false));document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)document.body.classList.remove('fullscreenView')});document.addEventListener('webkitfullscreenchange',()=>{if(!document.webkitFullscreenElement)document.body.classList.remove('fullscreenView')});setDashboardView(activeDashboardView);
 const rideSamples=[];
 function drawRideGraph(data){rideSamples.push({p:data.pitch,t:data.trigger,w:data.warningAngle});if(rideSamples.length>120)rideSamples.shift();const canvas=$('rideGraph'),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(240,canvas.clientWidth),h=canvas.clientHeight;canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);const maxY=Math.max(60,...rideSamples.map(s=>Math.max(s.p,s.w)))+5,toY=v=>h-8-(Math.max(0,v)/maxY)*(h-16);c.strokeStyle=getComputedStyle(document.body).getPropertyValue('--line');c.lineWidth=1;[0,20,40,60].forEach(v=>{c.beginPath();c.moveTo(0,toY(v));c.lineTo(w,toY(v));c.stroke()});const threshold=(key,color)=>{if(!rideSamples.length)return;c.strokeStyle=color;c.setLineDash([5,4]);c.beginPath();c.moveTo(0,toY(rideSamples[rideSamples.length-1][key]));c.lineTo(w,toY(rideSamples[rideSamples.length-1][key]));c.stroke();c.setLineDash([])};threshold('t','#4ca6ff');threshold('w','#ef4444');c.strokeStyle='#55e6ff';c.lineWidth=2;c.beginPath();rideSamples.forEach((s,i)=>{const x=i/Math.max(1,rideSamples.length-1)*w,y=toY(s.p);i?c.lineTo(x,y):c.moveTo(x,y)});c.stroke()}
-async function refreshRideData(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();$('eventCount').textContent=d.eventCount;$('activeDuration').textContent=(d.activeDuration/1000).toFixed(1)+' s';$('lastDuration').textContent=(d.lastDuration/1000).toFixed(1)+' s';$('lastEventPeak').textContent=d.lastPeakAngle.toFixed(1)+'° · +'+d.lastPeakG.toFixed(2)+' g';drawRideGraph(d)}catch(e){}}
+const rideDuration=ms=>{const total=Math.round(ms/1000),minutes=Math.floor(total/60),seconds=total%60;return minutes+'m '+String(seconds).padStart(2,'0')+'s'};
+async function downloadDashboardRide(id,format){const path=format==='csv'?'/api/ride/csv':'/api/ride/report';try{const r=await fetch(path+'?id='+encodeURIComponent(id));if(!r.ok)throw new Error(await r.text());const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-ride-'+id+(format==='csv'?'.csv':'-report.html');a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}catch(e){alert('Download failed: '+e.message)}}
+async function refreshRideSummary(){try{const r=await fetch('/api/rides',{cache:'no-store'}),d=await r.json();setText('rideStorageSummary',d.enabled?d.sessions.length+' of '+d.maxSessions+' stored':'Logging off');const latest=d.sessions.find(s=>!s.active);if(!latest){setText('lastRideMeta',d.enabled?'No completed rides yet. Return to STANDBY to finalize a ride.':'Enable ride logging in Settings to create hardware-recorded reports.');$('lastRideActions').hidden=true;return}setText('lastRideMeta','Ride #'+latest.id+' · '+rideDuration(latest.durationMs)+' · '+latest.wheelies+' wheelies · '+latest.peakPitch.toFixed(1)+'° pitch · '+latest.peakRoll.toFixed(1)+'° lean');$('lastRideActions').innerHTML='<button onclick="downloadDashboardRide('+latest.id+',\'report\')">Report</button><button onclick="downloadDashboardRide('+latest.id+',\'csv\')">CSV</button>';$('lastRideActions').hidden=false}catch(e){setText('lastRideMeta','Ride report summary unavailable')}}
 const stageEffectPrefs={wheelieMode:saved('wheelieEffectMode','off'),wheelieColor:saved('wheelieEffectColor','#22c55e'),warningMode:saved('warningEffectMode','off'),warningColor:saved('warningEffectColor','#ef4444'),warningAngle:clamp(parseFloat(saved('warningEffectAngle','15'))||15,0,70)};
 function updateStageEffect(){const stage=$('bikeStage'),isWheelie=$('state').textContent==='WHEELIE',angle=parseFloat($('pitch').textContent)||0;let mode='off',color='transparent';if(angle>=stageEffectPrefs.warningAngle&&stageEffectPrefs.warningMode!=='off'){mode=stageEffectPrefs.warningMode;color=stageEffectPrefs.warningColor}else if(isWheelie&&stageEffectPrefs.wheelieMode!=='off'){mode=stageEffectPrefs.wheelieMode;color=stageEffectPrefs.wheelieColor}stage.classList.toggle('effectSolid',mode==='solid');stage.classList.toggle('effectFlash',mode==='flash');stage.style.setProperty('--stage-effect-color',color)}
-$('themeBtn').addEventListener('click',()=>setTheme(document.body.dataset.theme==='light'?'dark':'light'));
-setTheme(saved('wheelieTheme','dark'));setBikeColor(saved('wheelieBikeColor','#4ca6ff'));setPitchTape(saved('wheeliePitchTape','on')!=='off');
-new MutationObserver(()=>{const armed=$('mode').textContent==='ARMED';$('mode').className=armed?'statusGood':'statusWarn';$('modeHint').textContent=armed?'Tap to disarm':'Tap to arm';}).observe($('mode'),{childList:true});
+$('themeBtn').addEventListener('click',()=>setTheme(document.body.dataset.theme==='dark'?'light':document.body.dataset.theme==='light'?'sunlight':'dark'));
+setTheme(saved('wheelieTheme','dark'));setBikeColor(saved('wheelieBikeColor','#4ca6ff'));setPitchTape(saved('wheeliePitchTape','on')!=='off');setLeanGauge(saved('wheelieLeanGauge','on')!=='off');
+new MutationObserver(()=>{const armed=$('mode').textContent==='ARMED';$('mode').className=armed?'statusGood':'statusWarn';$('modeHint').textContent=armed?'Hold to disarm':'Hold to arm';}).observe($('mode'),{childList:true});
 new MutationObserver(()=>{const angle=clamp(parseFloat($('pitch').textContent)||0,-60,60);$('pitchTape').style.transform='translateY('+(angle*3)+'px)';updateStageEffect()}).observe($('pitch'),{childList:true});
 new MutationObserver(updateStageEffect).observe($('state'),{childList:true});
-async function toggleMode(){if(!token)return;const button=$('modeControl'),next=$('mode').textContent==='ARMED'?'standby':'armed';button.disabled=true;try{const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+next,{method:'POST'});if(!r.ok)alert(await r.text());await refresh();}catch(e){alert('Controller connection lost');}finally{button.disabled=false}}
-let modeHoldStarted=0,modeHoldFrame=0,modeHoldTriggered=false;
-function clearModeHold(){cancelAnimationFrame(modeHoldFrame);modeHoldStarted=0;$('modeControl').classList.remove('holding');$('modeControl').style.setProperty('--hold-progress','0%')}
-async function recalibrateFromTile(){if(!confirm('Recalibrate the controller now? Keep the motorcycle level and completely still.'))return;const button=$('modeControl');button.disabled=true;try{const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});alert(await r.text());await refresh();}catch(e){alert('Calibration request failed')}finally{button.disabled=false}}
-function updateModeHold(now){if(!modeHoldStarted)return;const progress=Math.min(100,(now-modeHoldStarted)/50);$('modeControl').style.setProperty('--hold-progress',progress+'%');if(progress>=100){modeHoldTriggered=true;clearModeHold();recalibrateFromTile();return}modeHoldFrame=requestAnimationFrame(updateModeHold)}
-$('modeControl').addEventListener('pointerdown',e=>{if(e.button!==0||$('modeControl').disabled)return;modeHoldTriggered=false;modeHoldStarted=performance.now();$('modeControl').classList.add('holding');$('modeControl').setPointerCapture(e.pointerId);modeHoldFrame=requestAnimationFrame(updateModeHold)});
-$('modeControl').addEventListener('pointerup',()=>{const shouldToggle=modeHoldStarted&&!modeHoldTriggered;clearModeHold();if(shouldToggle)toggleMode()});
-$('modeControl').addEventListener('pointercancel',clearModeHold);
-$('modeControl').addEventListener('contextmenu',e=>e.preventDefault());
-$('modeControl').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.repeat){e.preventDefault();toggleMode()}});
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('pitch').textContent=d.pitch.toFixed(1)+'°';$('rawPitch').textContent=d.rawPitch.toFixed(1)+'°';$('baseline').textContent=d.baseline.toFixed(1)+'°';$('triggerPitch').textContent=d.pitch.toFixed(1)+'°';$('raw2').textContent=d.rawPitch.toFixed(1)+'°';$('base2').textContent=d.baseline.toFixed(1)+'°';$('trig2').textContent=d.pitch.toFixed(1)+'°';$('state').textContent=d.state;$('state').className=d.state==='WHEELIE'?'statusGood':d.state==='PENDING'?'statusWarn':'';$('mode').textContent=d.mode;$('output').textContent=d.output+'%';$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('baselineState').textContent=d.angleMode==='adaptive'?(d.baselineFrozen?'FROZEN':'TRACKING'):'FIXED';$('angleModeLine').textContent=d.angleMode.toUpperCase()+' angle mode';$('gyro').textContent=d.gyroRate.toFixed(1)+'°/s';$('gload').textContent=plusG(d.gLoad);$('peakAngle').textContent=d.peakAngle.toFixed(1)+'°';$('peakG').textContent=plusG(d.peakG);$('threshold').textContent=d.trigger.toFixed(1)+'°';gyroBar(d.gyroRate);$('gFill').style.width=clamp(d.gLoad/2.0*100,0,100)+'%';$('pitchFill').style.width=clamp(Math.max(0,d.pitch)/Math.max(1,d.trigger)*100,0,100)+'%';$('bikeWrap').style.transform='translate(-50%,-50%) rotate('+(-clamp(d.rawPitch,-55,55))+'deg)';$('connDot').style.background='var(--green)';$('connText').textContent='Connected';}catch(e){$('connDot').style.background='var(--red)';$('connText').textContent='Disconnected';}}
-async function resetPeak(kind){if(!token)return;try{await fetch('/api/peak/reset?token='+encodeURIComponent(token)+'&kind='+encodeURIComponent(kind),{method:'POST'});refresh();}catch(e){}}
-refresh();refreshRideData();setInterval(refresh,150);setInterval(refreshRideData,250);
+const modeButtons=[$('modeControl'),$('quickModeChip')];
+async function toggleMode(){if(!token)return;const next=$('mode').textContent==='ARMED'?'standby':'armed';modeButtons.forEach(button=>button.disabled=true);try{const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+next,{method:'POST'});if(!r.ok)alert(await r.text());await refresh();}catch(e){alert('Controller connection lost');}finally{modeButtons.forEach(button=>button.disabled=false)}}
+let modeHoldStarted=0,modeHoldFrame=0,modeHoldButton=null;
+function clearModeHold(){cancelAnimationFrame(modeHoldFrame);modeHoldStarted=0;if(modeHoldButton){modeHoldButton.classList.remove('holding');modeHoldButton.style.setProperty('--hold-progress','0%')}modeHoldButton=null}
+async function recalibrateFromTile(){if(!confirm('Recalibrate the controller now? Keep the motorcycle level and completely still.'))return;const button=$('calibrateButton');button.disabled=true;try{const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});alert(await r.text());await refresh()}catch(e){alert('Calibration request failed')}finally{button.disabled=false}}
+function updateModeHold(now){if(!modeHoldStarted||!modeHoldButton)return;const progress=Math.min(100,(now-modeHoldStarted)/12);modeHoldButton.style.setProperty('--hold-progress',progress+'%');if(progress>=100){clearModeHold();toggleMode();return}modeHoldFrame=requestAnimationFrame(updateModeHold)}
+function bindModeHold(button){button.addEventListener('pointerdown',e=>{if(e.button!==0||button.disabled)return;clearModeHold();modeHoldButton=button;modeHoldStarted=performance.now();button.classList.add('holding');if(button.setPointerCapture)button.setPointerCapture(e.pointerId);modeHoldFrame=requestAnimationFrame(updateModeHold)});button.addEventListener('pointerup',clearModeHold);button.addEventListener('pointercancel',clearModeHold);button.addEventListener('contextmenu',e=>e.preventDefault());button.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.repeat){e.preventDefault();if(confirm('Change controller mode?'))toggleMode()}})}
+modeButtons.forEach(bindModeHold);
+$('calibrateButton').addEventListener('click',recalibrateFromTile);
+async function refresh(){if(refreshBusy)return;refreshBusy=true;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('status');const d=await r.json();token=d.token;lastStatusAt=performance.now();$('staleBanner').classList.remove('active');setText('pitch',d.pitch.toFixed(1)+'°');setText('rawPitch',d.rawPitch.toFixed(1)+'°');setText('baseline',d.baseline.toFixed(1)+'°');setText('triggerPitch',d.pitch.toFixed(1)+'°');setText('raw2',d.rawPitch.toFixed(1)+'°');setText('base2',d.baseline.toFixed(1)+'°');setText('trig2',d.pitch.toFixed(1)+'°');setText('state',d.state);$('state').className=d.state==='WHEELIE'?'statusGood':d.state==='PENDING'?'statusWarn':'';setText('mode',d.mode);setText('output',d.output+'%');setText('imu',d.imu?'OK':'FAULT');$('imu').className=d.imu?'statusGood':'statusBad';setText('baselineState',d.angleMode==='adaptive'?(d.baselineFrozen?'FROZEN':'TRACKING'):'FIXED');setText('angleModeLine',d.angleMode.toUpperCase()+' angle mode');setText('gyro',d.gyroRate.toFixed(1)+'°/s');setText('gload',plusG(d.gLoad));setText('peakAngle',d.peakAngle.toFixed(1)+'°');setText('peakG',plusG(d.peakG));setText('threshold',d.trigger.toFixed(1)+'°');setText('rollValue',d.roll.toFixed(1)+'°');setText('rollRateValue',d.rollRate.toFixed(1)+'°/s');setText('leanHud',(d.roll>0?'+':'')+d.roll.toFixed(1)+'°');setText('eventCount',d.eventCount);setText('activeDuration',(d.activeDuration/1000).toFixed(1)+' s');setText('lastDuration',(d.lastDuration/1000).toFixed(1)+' s');setText('lastEventPeak',d.lastPeakAngle.toFixed(1)+'° · +'+d.lastPeakG.toFixed(2)+' g');const armed=d.mode==='ARMED';setText('quickMode',d.mode);$('quickModeChip').classList.toggle('modeArmed',armed);$('quickModeChip').classList.toggle('modeStandby',!armed);setText('quickConnection','LIVE');$('quickConnectionChip').className='safetyChip connected';setText('quickOutput',d.output+'%');const logText=!d.rideLoggingAvailable?'UNAVAILABLE':d.rideLoggingActive?'REC '+rideDuration(d.rideSampleCount/d.rideSampleRateHz*1000):d.rideLoggingEnabled?'READY':'OFF';setText('quickLog',logText);$('quickLogChip').className='safetyChip '+(d.rideLoggingActive?'recording':d.rideLoggingEnabled?'loggingReady':'');$('warningRibbon').classList.toggle('on',d.warningActive);$('warningMarker').style.top='calc(50% - '+clamp(d.warningAngle,-60,60)*3+'px)';$('triggerMarker').style.top='calc(50% - '+clamp(d.trigger,-60,60)*3+'px)';$('hudHorizon').style.transform='rotate('+(-clamp(d.roll,-45,45))+'deg)';$('leanDot').style.transform='translate(calc(-50% + '+(clamp(d.roll,-50,50)/50*65)+'px),-50%)';gyroBar(d.gyroRate);$('gFill').style.width=clamp(d.gLoad/2*100,0,100)+'%';$('pitchFill').style.width=clamp(Math.max(0,d.pitch)/Math.max(1,d.trigger)*100,0,100)+'%';$('bikeWrap').style.transform='translate(-50%,-50%) rotate('+(-clamp(d.rawPitch,-55,55))+'deg)';$('connDot').style.background='var(--green)';setText('connText','Connected');if(performance.now()-lastGraphAt>=200){lastGraphAt=performance.now();drawRideGraph(d)}}catch(e){$('connDot').style.background='var(--red)';setText('connText','Disconnected');setText('quickConnection','LOST');$('quickConnectionChip').className='safetyChip disconnected';$('staleBanner').classList.add('active')}finally{refreshBusy=false}}
+function updateStaleState(){if(lastStatusAt&&performance.now()-lastStatusAt>1500){$('staleBanner').classList.add('active');setText('quickConnection','STALE');$('quickConnectionChip').className='safetyChip disconnected'}}
+async function resetPeak(kind){if(!token||!confirm('Reset the highest '+(kind==='g'?'+G load':'angle')+' value?'))return;try{await fetch('/api/peak/reset?token='+encodeURIComponent(token)+'&kind='+encodeURIComponent(kind),{method:'POST'});refresh()}catch(e){}}
+refresh();refreshRideSummary();setInterval(()=>{if(!document.hidden)refresh()},100);setInterval(updateStaleState,500);setInterval(()=>{if(!document.hidden)refreshRideSummary()},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();refreshRideSummary()}});
 </script>
 </body>
 </html>
@@ -1732,21 +2042,22 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Wheelie Settings</title>
 <style>
-:root{color-scheme:dark;--bg:#080b10;--panel:#111720;--line:#273449;--text:#f4f7fb;--muted:#8f9bad;--accent:#4ea1ff;--accent2:#8f66ff;--good:#52df9a;--warn:#ffc857;--bad:#ff6577}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0,rgba(78,161,255,.18),transparent 30%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{width:min(940px,100%);margin:auto;padding:16px}.top{display:flex;align-items:center;gap:10px;margin:4px 0 15px}.back{width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--line);border-radius:13px;background:#111720;color:white;text-decoration:none;font-size:24px}.title h1{font-size:25px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:13px}.card{grid-column:span 12;background:linear-gradient(180deg,#151d28,#0f151e);border:1px solid var(--line);border-radius:18px;padding:17px}@media(min-width:740px){.half{grid-column:span 6}}h2{font-size:15px;margin:0 0 13px}.rows{display:grid}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}.row span,label{color:var(--muted)}label{display:block;font-size:12px;margin:12px 0 6px}input,select{width:100%;padding:12px;border-radius:11px;border:1px solid var(--line);background:#090e15;color:white;font:inherit}.range{display:grid;grid-template-columns:1fr 78px;gap:9px;align-items:center}.range input{padding:0}.range output{text-align:center;background:#090e15;border:1px solid var(--line);border-radius:10px;padding:9px 4px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.wide{grid-column:1/-1}button{border:0;border-radius:11px;padding:13px;font:inherit;font-weight:750;background:#29364a;color:white;cursor:pointer}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2))}.good{background:#173b2d;color:#7cf5b9;border:1px solid #245c43}.warn{background:#3b3118;color:#ffd978;border:1px solid #665326}.bad{background:#421e27;color:#ff9dab;border:1px solid #6d2f3d}.note{font-size:12px;line-height:1.5;color:var(--muted)}.message{position:sticky;bottom:10px;width:max-content;max-width:100%;margin:14px auto 0;padding:9px 14px;background:#121a25;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}.hidden{display:none}.file{border-style:dashed}.statusGood{color:var(--good)}.statusBad{color:var(--bad)}.statusWarn{color:var(--warn)}
+:root{color-scheme:dark;--bg:#080b10;--panel:#111720;--line:#273449;--text:#f4f7fb;--muted:#8f9bad;--accent:#4ea1ff;--accent2:#8f66ff;--good:#52df9a;--warn:#ffc857;--bad:#ff6577}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 12% 0,rgba(78,161,255,.18),transparent 30%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{width:min(940px,100%);margin:auto;padding:16px}.top{display:flex;align-items:center;gap:10px;margin:4px 0 15px}.back{width:42px;height:42px;display:grid;place-items:center;border:1px solid var(--line);border-radius:13px;background:#111720;color:white;text-decoration:none;font-size:24px}.title h1{font-size:25px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:13px}.card{grid-column:span 12;background:linear-gradient(180deg,#151d28,#0f151e);border:1px solid var(--line);border-radius:18px;padding:17px}@media(min-width:740px){.half{grid-column:span 6}}h2{font-size:15px;margin:0 0 13px}.rows{display:grid}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.row:last-child{border-bottom:0}.row span,label{color:var(--muted)}label{display:block;font-size:12px;margin:12px 0 6px}input,select{width:100%;padding:12px;border-radius:11px;border:1px solid var(--line);background:#090e15;color:white;font:inherit}.range{display:grid;grid-template-columns:1fr 78px;gap:9px;align-items:center}.range input{padding:0}.range output{text-align:center;background:#090e15;border:1px solid var(--line);border-radius:10px;padding:9px 4px}.actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}.wide{grid-column:1/-1}button{border:0;border-radius:11px;padding:13px;font:inherit;font-weight:750;background:#29364a;color:white;cursor:pointer}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2))}.good{background:#173b2d;color:#7cf5b9;border:1px solid #245c43}.warn{background:#3b3118;color:#ffd978;border:1px solid #665326}.bad{background:#421e27;color:#ff9dab;border:1px solid #6d2f3d}.note{font-size:12px;line-height:1.5;color:var(--muted)}.message{position:sticky;bottom:10px;width:max-content;max-width:100%;margin:14px auto 0;padding:9px 14px;background:#121a25;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:12px}.hidden{display:none}.file{border-style:dashed}.statusGood{color:var(--good)}.statusBad{color:var(--bad)}.statusWarn{color:var(--warn)}.proof{display:inline-grid;place-items:center;text-align:center;padding:11px 14px;border:2px solid var(--good);border-radius:13px;color:#7cf5b9;background:#102a21;font-size:12px;font-weight:900;letter-spacing:.08em;transform:rotate(1deg)}.proof small{display:block;margin-top:3px;color:#a9c6b8;font-size:8px}.reportHead{display:flex;justify-content:space-between;align-items:start;gap:14px}.rideList{display:grid;gap:9px;margin-top:14px}.rideItem{padding:12px;border:1px solid var(--line);border-radius:13px;background:#090e15}.rideTop{display:flex;justify-content:space-between;gap:10px}.rideMeta{margin-top:5px;color:var(--muted);font-size:11px}.rideActions{display:flex;gap:7px;margin-top:10px}.rideActions button{padding:9px 11px;font-size:12px}@media(max-width:460px){.reportHead{display:block}.proof{margin:6px 0 10px}.rideTop{display:block}}
 </style>
 </head>
 <body><div class="wrap">
 <header class="top"><a class="back" href="/" aria-label="Dashboard">‹</a><div class="title"><h1>Controller Settings</h1><p>Configuration, service controls & firmware</p></div></header>
 <div class="grid">
 <section class="card half"><h2>Wheelie Detection</h2><label>Angle processing mode</label><select id="angleMode"><option value="absolute">Absolute — fixed calibration zero</option><option value="adaptive">Adaptive — follows gradual terrain</option></select><div id="adaptiveSettings"><label>Adaptive zero time constant (seconds)</label><input id="adaptiveTau" type="number" min="0.5" max="60" step="0.5"><label>Freeze baseline above pitch rate (°/sec)</label><input id="freezeRate" type="number" min="1" max="100" step="0.5"><p class="note">The adaptive baseline follows hills slowly, but freezes during rapid pitch changes and wheelie detection.</p></div><label>Trigger angle (°)</label><input id="trigger" type="number" min="5" max="70" step="0.5"><label>Reset angle (°)</label><input id="reset" type="number" min="0" max="69" step="0.5"><label>Trigger hold (ms)</label><input id="hold" type="number" min="0" max="5000" step="10"><label>Minimum ON time (ms)</label><input id="minon" type="number" min="0" max="15000" step="50"></section>
-<section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
+<section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><label>Ride telemetry logging</label><select id="rideLogging"><option value="disabled">Disabled — default</option><option value="enabled">Enabled — retain 3 rides</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Ride logging is opt-in and disabled by default. Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
 <section class="card half"><h2>Mounting & Orientation</h2><input type="hidden" id="rotationAxis" value="y"><div class="rows"><div class="row"><span>Setup</span><strong id="orientationState">---</strong></div><div class="row"><span>Pitch axis</span><strong id="pitchAxisLive">---</strong></div><div class="row"><span>Roll axis</span><strong id="rollAxisLive">---</strong></div><div class="row"><span>Vertical axis</span><strong id="verticalAxisLive">---</strong></div><div class="row"><span>Live lean</span><strong id="leanAngle">0.0°</strong></div></div><div class="actions"><button class="primary wide" onclick="runOrientationWizard()">Run Mounting Wizard</button></div><p class="note">This runs automatically on first setup and is saved in device memory. Park securely, hold the bike upright, then lean it smoothly side to side several times without lifting the wheels. Output remains OFF and the controller stays in STANDBY afterward.</p></section>
-<section class="card half"><h2>Dashboard Appearance</h2><label for="bikeColor">Motorcycle accent color</label><div style="display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center"><input id="bikeColor" type="color" value="#4ca6ff" style="height:54px;padding:5px;cursor:pointer"><div id="colorSwatch" style="height:54px;border-radius:11px;border:1px solid var(--line);background:var(--bikePreview);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div></div><label for="pitchTapeSetting">Pitch tape</label><select id="pitchTapeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><div class="actions"><button class="wide" type="button" onclick="resetBikeColor()">Reset Default Color</button></div><p class="note">Appearance preferences are stored by this browser and apply to the dashboard on this device.</p></section>
+<section class="card half"><h2>Dashboard Appearance</h2><label for="bikeColor">Motorcycle accent color</label><div style="display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center"><input id="bikeColor" type="color" value="#4ca6ff" style="height:54px;padding:5px;cursor:pointer"><div id="colorSwatch" style="height:54px;border-radius:11px;border:1px solid var(--line);background:var(--bikePreview);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div></div><label for="pitchTapeSetting">Pitch tape</label><select id="pitchTapeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><label for="leanGaugeSetting">Rider HUD lean gauge</label><select id="leanGaugeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><div class="actions"><button class="wide" type="button" onclick="resetBikeColor()">Reset Default Color</button></div><p class="note">The lean gauge uses the roll axis saved by the mounting wizard. Appearance preferences are stored by this browser and apply to the dashboard on this device.</p></section>
 <section class="card half"><h2>Pitch Display Alerts</h2><label for="wheelieEffectMode">Wheelie background</label><select id="wheelieEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><label for="wheelieEffectColor">Wheelie color</label><input id="wheelieEffectColor" type="color" value="#22c55e" style="height:48px;padding:5px;cursor:pointer"><label for="warningEffectMode">Angle warning background</label><select id="warningEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><div style="display:grid;grid-template-columns:1fr 82px;gap:10px"><div><label for="warningEffectAngle">Warning angle (°)</label><input id="warningEffectAngle" type="number" min="0" max="70" step="0.5" value="15"></div><div><label for="warningEffectColor">Color</label><input id="warningEffectColor" type="color" value="#ef4444" style="height:48px;padding:5px;cursor:pointer"></div></div><p class="note">Both effects are disabled by default. The high-angle warning takes priority whenever its threshold is reached.</p></section>
 <section class="card half"><h2>Physical Light Patterns</h2><label for="wheeliePattern">Wheelie pattern</label><select id="wheeliePattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningPattern">High-angle warning pattern</label><select id="warningPattern"><option value="0">Off</option><option value="1">Solid</option><option value="2">Slow pulse</option><option value="3">Fast pulse</option><option value="4">Strobe</option></select><label for="warningBrightness">Warning brightness</label><div class="range"><input id="warningBrightness" type="range" min="1" max="100"><output id="warningBrightnessOut">100%</output></div><label for="warningAngleFirmware">Warning activation angle (°)</label><input id="warningAngleFirmware" type="number" min="5" max="85" step="0.5"><label for="warningResetFirmware">Warning release angle (°)</label><input id="warningResetFirmware" type="number" min="0" max="84" step="0.5"><label for="warningRateFirmware">Early warning pitch rate (°/s, 0 disables)</label><input id="warningRateFirmware" type="number" min="0" max="250" step="1"><p class="note">The warning uses angle hysteresis to prevent chatter. A rapid rise can activate it early after the normal wheelie threshold is crossed.</p></section>
 <section class="card half"><h2>Controller</h2><div class="rows"><div class="row"><span>Current mode</span><strong id="mode">---</strong></div><div class="row"><span>IMU</span><strong id="imu">---</strong></div><div class="row"><span>Angle mode</span><strong id="angleModeLive">---</strong></div><div class="row"><span>Current +G load</span><strong id="gload">---</strong></div></div><div class="actions"><button class="good" onclick="setMode('armed')">ARM</button><button class="warn" onclick="setMode('standby')">STANDBY</button><button class="bad wide" onclick="calibrate()">Recalibrate Level</button></div><p class="note">Engine-idle vibration is acceptable during calibration as long as the motorcycle remains stationary and is not being rocked.</p></section>
 <section class="card half"><h2>Manual Output Test</h2><div class="actions"><button onclick="testOutput(25)">25%</button><button onclick="testOutput(50)">50%</button><button onclick="testOutput(75)">75%</button><button onclick="testOutput(100)">100%</button><button class="bad wide" onclick="testOutput(0)">OFF</button></div><p class="note">Only available in STANDBY. Non-zero test commands automatically expire after 10 seconds.</p></section>
 <section class="card half"><h2>Network & System</h2><div class="rows"><div class="row"><span>Access point</span><strong id="apState">ON</strong></div><div class="row"><span>SSID</span><strong id="apSsid">---</strong></div><div class="row"><span>Friendly address</span><strong>wheelie.local</strong></div><div class="row"><span>Guaranteed fallback</span><strong>192.168.4.1</strong></div><div class="row"><span>Discovery</span><strong id="discovery">---</strong></div><div class="row"><span>Clients</span><strong id="clients">0</strong></div><div class="row"><span>Uptime</span><strong id="uptime">0 sec</strong></div><div class="row"><span>Firmware</span><strong id="firmware">---</strong></div><div class="row"><span>Build commit</span><strong id="buildCommit">---</strong></div><div class="row"><span>Build date</span><strong id="buildDate">---</strong></div><div class="row"><span>Release channel</span><strong id="releaseChannel">---</strong></div><div class="row"><span>Hardware target</span><strong id="hardwareTarget">---</strong></div></div><label>Wi-Fi password</label><input id="wifiPassword" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="Enter a new 8-63 character password"><div class="actions"><button class="primary wide" onclick="saveWifiPassword()">Update Wi-Fi Password</button><button class="wide" onclick="generateWifiPassword()">Generate Unique Device Password</button></div><p class="note">Changing or generating the password restarts the access point and disconnects this browser. A generated password is shown once so it can be copied before reconnecting. Hold the physical button for <b>30 seconds</b> to restore <b>wheeliectrl</b>.</p><p class="note"><b>Triple-tap</b> toggles the access point. mDNS and the captive DNS/portal fallback remain enabled; use <b>192.168.4.1</b> if <b>wheelie.local</b> is unavailable.</p></section>
+<section class="card"><div class="reportHead"><div><h2>Ride Reports</h2><p class="note">When enabled, telemetry is sampled at 5 Hz for up to 90 minutes per ride. Only the newest 3 sessions are kept; the oldest is overwritten automatically.</p></div><div class="proof">DEVICE-RECORDED<small>SENSOR DATA · SHA-256</small></div></div><div id="rideReports" class="rideList"><div class="rideItem note">Loading ride sessions…</div></div><p class="note">The checksum can detect changes to the sample stream. It is not a third-party certification or a cryptographic device signature.</p></section>
 <section class="card half"><h2>Configuration Backup</h2><div class="actions"><button onclick="exportSettings()">Export JSON</button><button onclick="$('settingsFile').click()">Import JSON</button></div><input class="file hidden" id="settingsFile" type="file" accept=".json,application/json"><p class="note">Export includes controller settings and browser-local dashboard appearance. Imported values are validated by the controller when applied.</p></section>
 <section class="card half"><h2>Firmware Update & Recovery</h2><label for="otaChannel">Accepted OTA channel</label><select id="otaChannel"><option value="stable">Stable — main branch releases</option><option value="testing">Testing — testing branch builds</option></select><input class="file" id="firmwareFile" type="file" accept=".wctrl,application/octet-stream"><div class="actions"><button class="primary wide" onclick="uploadFirmware()">Upload Signed OTA Package</button><button class="bad wide" onclick="rollbackFirmware()">Return to Previous Firmware</button></div><p class="note">Only signed <b>.wctrl</b> packages for this XIAO ESP32-S3 and the selected channel are accepted. The firmware SHA-256 and ECDSA signature are verified before the OTA partition is activated. Save Settings after changing channels.</p><p class="note">The output is forced OFF during updates and rollback. The previous image remains in the alternate OTA partition until another update replaces it.</p></section>
 </div><div class="message" id="message">Ready</div></div>
@@ -1757,9 +2068,10 @@ function applyBikeColor(color){$('bikeColor').value=color;$('colorSwatch').style
 function resetBikeColor(){applyBikeColor('#4ca6ff');msg('Dashboard bike color reset')}
 $('bikeColor').addEventListener('input',e=>applyBikeColor(e.target.value));applyBikeColor(savedBikeColor);
 let savedPitchTape='on';try{savedPitchTape=localStorage.getItem('wheeliePitchTape')||'on'}catch(e){}$('pitchTapeSetting').value=savedPitchTape;$('pitchTapeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheeliePitchTape',e.target.value)}catch(err){}msg('Pitch tape preference saved')});
+let savedLeanGauge='on';try{savedLeanGauge=localStorage.getItem('wheelieLeanGauge')||'on'}catch(e){}$('leanGaugeSetting').value=savedLeanGauge;$('leanGaugeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheelieLeanGauge',e.target.value)}catch(err){}msg('Lean gauge preference saved')});
 const localValue=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};const effectFields={wheelieEffectMode:'off',wheelieEffectColor:'#22c55e',warningEffectMode:'off',warningEffectAngle:'15',warningEffectColor:'#ef4444'};Object.entries(effectFields).forEach(([id,fallback])=>{$(id).value=localValue(id,fallback);$(id).addEventListener('change',e=>{let value=e.target.value;if(id==='warningEffectAngle'){value=String(Math.max(0,Math.min(70,parseFloat(value)||15)));e.target.value=value}try{localStorage.setItem(id,value)}catch(err){}msg('Pitch alert preference saved')})});
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('orientationState').textContent=d.orientationConfigured?'SAVED':'REQUIRED';$('orientationState').className=d.orientationConfigured?'statusGood':'statusWarn';$('pitchAxisLive').textContent=d.rotationAxis.toUpperCase();$('rollAxisLive').textContent=d.rollAxis.toUpperCase();$('verticalAxisLive').textContent=d.verticalAxis.toUpperCase();$('leanAngle').textContent=d.roll.toFixed(1)+'°';$('rotationAxis').value=d.rotationAxis;$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;$('buildCommit').textContent=d.buildCommit;$('buildDate').textContent=d.buildDate;$('releaseChannel').textContent=d.releaseChannel.toUpperCase();$('hardwareTarget').textContent=d.board+' / '+d.chip;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';$('otaChannel').value=d.otaChannel;syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
-async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value,otaChannel:$('otaChannel').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('orientationState').textContent=d.orientationConfigured?'SAVED':'REQUIRED';$('orientationState').className=d.orientationConfigured?'statusGood':'statusWarn';$('pitchAxisLive').textContent=d.rotationAxis.toUpperCase();$('rollAxisLive').textContent=d.rollAxis.toUpperCase();$('verticalAxisLive').textContent=d.verticalAxis.toUpperCase();$('leanAngle').textContent=d.roll.toFixed(1)+'°';$('rotationAxis').value=d.rotationAxis;$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;$('buildCommit').textContent=d.buildCommit;$('buildDate').textContent=d.buildDate;$('releaseChannel').textContent=d.releaseChannel.toUpperCase();$('hardwareTarget').textContent=d.board+' / '+d.chip;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';$('rideLogging').value=d.rideLoggingEnabled?'enabled':'disabled';$('otaChannel').value=d.otaChannel;syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
+async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,rideLogging:$('rideLogging').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value,otaChannel:$('otaChannel').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();refreshRideReports();}
 async function setMode(mode){const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+mode,{method:'POST'});msg(await r.text());refresh();}
 async function calibrate(){msg('Calibrating — keep bike stationary...');const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());refresh();}
 async function runOrientationWizard(){if(!confirm('Park securely and run the mounting wizard now? The controller will enter STANDBY. Follow the OLED prompts: upright first, then lean side to side.'))return;msg('Wizard running — follow the OLED prompts on the bike...');try{const r=await fetch('/api/orientation?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());settingsLoaded=false;axisLoaded=false;refresh();refreshSsid()}catch(e){msg('Wizard connection failed — check the controller display')}}
@@ -1767,11 +2079,14 @@ async function refreshSsid(){try{const r=await fetch('/api/status',{cache:'no-st
 async function testOutput(level){const r=await fetch('/api/output?token='+encodeURIComponent(token)+'&level='+level,{method:'POST'});msg(await r.text());refresh();}
 async function saveWifiPassword(){const p=$('wifiPassword').value;if(p.length<8||p.length>63){msg('Wi-Fi password must be 8-63 characters');return;}if(!confirm('Change Wi-Fi password? You will need to reconnect.'))return;const body=new URLSearchParams({password:p});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());$('wifiPassword').value='';}catch(e){msg('Password saved; reconnect to the controller AP');}}
 async function generateWifiPassword(){if(!confirm('Generate a unique 16-character password for this controller? Copy it before reconnecting.'))return;const body=new URLSearchParams({generate:'1'});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}),text=await r.text();alert(text);msg('Password generated; reconnect to the controller AP')}catch(e){msg('Password generated; reconnect and use the password shown')}}
-function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware','otaChannel'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
+function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','rideLogging','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware','otaChannel'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieLeanGauge','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
+function rideDuration(ms){const total=Math.round(ms/1000),minutes=Math.floor(total/60),seconds=total%60;return minutes+'m '+String(seconds).padStart(2,'0')+'s'}
+async function downloadRide(id,format){const path=format==='csv'?'/api/ride/csv':'/api/ride/report';try{const r=await fetch(path+'?id='+encodeURIComponent(id));if(!r.ok)throw new Error(await r.text());const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-ride-'+id+(format==='csv'?'.csv':'-report.html');a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);msg('Ride '+id+' '+format.toUpperCase()+' downloaded')}catch(e){msg('Download failed: '+e.message)}}
+async function refreshRideReports(){try{const r=await fetch('/api/rides',{cache:'no-store'}),d=await r.json(),list=$('rideReports');if(!d.available){list.innerHTML='<div class="rideItem note">Ride storage is unavailable.</div>';return}if(!d.sessions.length){list.innerHTML='<div class="rideItem note">'+(d.enabled?'No completed rides yet. Arm the controller to begin a session.':'Logging is disabled. Enable it under Output &amp; Startup, then save settings.')+'</div>';return}list.innerHTML=d.sessions.map(s=>'<div class="rideItem"><div class="rideTop"><strong>Ride #'+s.id+(s.active?' · RECORDING':'')+'</strong><span>'+rideDuration(s.durationMs)+'</span></div><div class="rideMeta">'+s.samples.toLocaleString()+' samples · '+s.wheelies+' wheelies · '+s.peakPitch.toFixed(1)+'° peak pitch · '+s.peakRoll.toFixed(1)+'° peak lean</div>'+(s.active?'<div class="rideMeta">Return to STANDBY to finalize and download this ride.</div>':'<div class="rideActions"><button onclick="downloadRide('+s.id+',\'report\')">Ride Report</button><button onclick="downloadRide('+s.id+',\'csv\')">CSV Data</button></div>')+'</div>').join('')}catch(e){$('rideReports').innerHTML='<div class="rideItem note">Unable to load ride reports.</div>'}}
 $('settingsFile').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());if(data.format!=='wheelie-controller-settings'||!data.controller)throw new Error('Unsupported settings file');Object.entries(data.controller).forEach(([id,value])=>{if($(id))$(id).value=value});if(data.appearance)Object.entries(data.appearance).forEach(([key,value])=>{if(value!==null)localStorage.setItem(key,value)});$('brightnessOut').textContent=$('brightness').value+'%';$('fadeOut').textContent=$('fade').value+' ms';$('warningBrightnessOut').textContent=$('warningBrightness').value+'%';if(confirm('Settings loaded. Apply them to the controller now?'))await saveSettings();else msg('Settings loaded for review; use Save Settings to apply')}catch(err){msg('Import failed: '+err.message)}e.target.value=''});
 async function rollbackFirmware(){if(!confirm('Reboot into the previous firmware image?'))return;try{const r=await fetch('/api/rollback?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text())}catch(e){msg('Controller is rebooting or rollback failed')}}
 async function uploadFirmware(){const f=$('firmwareFile').files[0];if(!f){msg('Choose a signed .wctrl package first');return;}if(!f.name.toLowerCase().endsWith('.wctrl')){msg('Unsigned .bin files are not accepted');return;}if(!confirm('Verify and install '+f.name+'?'))return;const form=new FormData();form.append('update',f,f.name);msg('Verifying signed firmware — do not remove power...');try{const r=await fetch('/api/update?token='+encodeURIComponent(token),{method:'POST',body:form});msg(await r.text());}catch(e){msg('Controller rebooting — reconnect shortly');}}
-refresh();refreshSsid();setInterval(refresh,500);setInterval(refreshSsid,5000);
+refresh();refreshSsid();refreshRideReports();setInterval(refresh,500);setInterval(refreshSsid,5000);setInterval(refreshRideReports,5000);
 </script></body></html>
 )rawliteral";
 
@@ -1861,6 +2176,15 @@ void handleStatus() {
     json += ",\"releaseChannel\":\"" + String(RELEASE_CHANNEL) + "\"";
     json += ",\"otaChannel\":\"" + otaChannel + "\"";
     json += ",\"signedOta\":true";
+    json += ",\"rideLoggingEnabled\":" + String(rideLoggingEnabled ? "true" : "false");
+    json += ",\"rideLoggingAvailable\":" + String(rideStorageReady ? "true" : "false");
+    json += ",\"rideLoggingActive\":" + String(rideSessionActive ? "true" : "false");
+    json += ",\"rideSessionId\":" + String(rideSessionActive ? activeRideHeader.sessionId : 0);
+    json += ",\"rideSampleCount\":" + String(rideSessionActive ? activeRideHeader.sampleCount : 0);
+    json += ",\"rideStorageUsed\":" + String(rideStorageReady ? LittleFS.usedBytes() : 0);
+    json += ",\"rideStorageTotal\":" + String(rideStorageReady ? LittleFS.totalBytes() : 0);
+    json += ",\"rideSessionLimit\":" + String(RIDE_LOG_MAX_SESSIONS);
+    json += ",\"rideSampleRateHz\":" + String(RIDE_LOG_SAMPLE_RATE_HZ);
     json += ",\"calOneGRaw\":" + String(calibrationRestMagnitudeRaw, 4);
     json += ",\"calAccelRms\":" + String(calibrationAccelNoiseRms, 4);
     json += ",\"calGyroRms\":" + String(calibrationGyroNoiseRms, 2);
@@ -1871,6 +2195,201 @@ void handleStatus() {
     server.send(200, "application/json", json);
 }
 
+String rideDigestHex(const uint8_t digest[32]) {
+    static const char* hex = "0123456789abcdef";
+    String result;
+    result.reserve(64);
+    for (size_t index = 0; index < 32; ++index) {
+        result += hex[digest[index] >> 4];
+        result += hex[digest[index] & 0x0F];
+    }
+    return result;
+}
+
+uint8_t collectRideHeaders(RideLogHeader headers[RIDE_LOG_MAX_SESSIONS],
+                           uint8_t slots[RIDE_LOG_MAX_SESSIONS]) {
+    if (rideSessionActive) writeActiveRideHeader();
+    uint8_t count = 0;
+    for (uint8_t slot = 0; slot < RIDE_LOG_MAX_SESSIONS; ++slot) {
+        RideLogHeader header;
+        if (readRideHeader(slot, header)) {
+            headers[count] = header;
+            slots[count] = slot;
+            count++;
+        }
+    }
+    for (uint8_t left = 0; left < count; ++left) {
+        for (uint8_t right = left + 1; right < count; ++right) {
+            if (headers[right].sessionId > headers[left].sessionId) {
+                RideLogHeader temporaryHeader = headers[left];
+                headers[left] = headers[right];
+                headers[right] = temporaryHeader;
+                const uint8_t temporarySlot = slots[left];
+                slots[left] = slots[right];
+                slots[right] = temporarySlot;
+            }
+        }
+    }
+    return count;
+}
+
+bool findRideSession(uint32_t sessionId, RideLogHeader& header, uint8_t& slot) {
+    RideLogHeader headers[RIDE_LOG_MAX_SESSIONS];
+    uint8_t slots[RIDE_LOG_MAX_SESSIONS];
+    const uint8_t count = collectRideHeaders(headers, slots);
+    for (uint8_t index = 0; index < count; ++index) {
+        if (headers[index].sessionId == sessionId) {
+            header = headers[index];
+            slot = slots[index];
+            return true;
+        }
+    }
+    return false;
+}
+
+void handleRideList() {
+    RideLogHeader headers[RIDE_LOG_MAX_SESSIONS];
+    uint8_t slots[RIDE_LOG_MAX_SESSIONS];
+    const uint8_t count = collectRideHeaders(headers, slots);
+    String json;
+    json.reserve(1800);
+    json = "{\"available\":" + String(rideStorageReady ? "true" : "false");
+    json += ",\"enabled\":" + String(rideLoggingEnabled ? "true" : "false");
+    json += ",\"active\":" + String(rideSessionActive ? "true" : "false");
+    json += ",\"maxSessions\":" + String(RIDE_LOG_MAX_SESSIONS);
+    json += ",\"sampleRateHz\":" + String(RIDE_LOG_SAMPLE_RATE_HZ);
+    json += ",\"maxSessionMinutes\":" + String(RIDE_LOG_MAX_DURATION_MS / 60000.0f, 1);
+    json += ",\"usedBytes\":" + String(rideStorageReady ? LittleFS.usedBytes() : 0);
+    json += ",\"totalBytes\":" + String(rideStorageReady ? LittleFS.totalBytes() : 0);
+    json += ",\"sessions\":[";
+    for (uint8_t index = 0; index < count; ++index) {
+        const RideLogHeader& header = headers[index];
+        if (index) json += ',';
+        json += "{\"id\":" + String(header.sessionId);
+        json += ",\"active\":" + String(rideSessionActive && header.sessionId == activeRideHeader.sessionId ? "true" : "false");
+        json += ",\"complete\":" + String((header.flags & RIDE_HEADER_COMPLETE) ? "true" : "false");
+        json += ",\"recovered\":" + String((header.flags & RIDE_HEADER_RECOVERED) ? "true" : "false");
+        json += ",\"capacityReached\":" + String((header.flags & RIDE_HEADER_CAPACITY_REACHED) ? "true" : "false");
+        json += ",\"durationMs\":" + String(header.durationMs);
+        json += ",\"samples\":" + String(header.sampleCount);
+        json += ",\"wheelies\":" + String(header.wheelieCount);
+        json += ",\"peakPitch\":" + String(header.peakPitchCentiDeg / 100.0f, 2);
+        json += ",\"peakRoll\":" + String(header.peakRollCentiDeg / 100.0f, 2);
+        json += ",\"peakGyro\":" + String(header.peakGyroCentiDegSec / 100.0f, 2);
+        json += ",\"peakG\":" + String(header.peakGMillig / 1000.0f, 3);
+        json += ",\"firmware\":\"" + String(header.firmware) + "\"";
+        json += ",\"commit\":\"" + String(header.commit) + "\"";
+        json += ",\"channel\":\"" + String(header.channel) + "\"";
+        json += ",\"sha256\":\"" + rideDigestHex(header.sampleSha256) + "\"}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+}
+
+bool requestedRide(RideLogHeader& header, uint8_t& slot) {
+    if (!server.hasArg("id")) {
+        server.send(400, "text/plain", "Missing ride session id");
+        return false;
+    }
+    const uint32_t sessionId = static_cast<uint32_t>(server.arg("id").toInt());
+    if (sessionId == 0 || !findRideSession(sessionId, header, slot)) {
+        server.send(404, "text/plain", "Ride session not found");
+        return false;
+    }
+    if (rideSessionActive && sessionId == activeRideHeader.sessionId) {
+        server.send(409, "text/plain", "Finish the ride before downloading its report");
+        return false;
+    }
+    return true;
+}
+
+void handleRideCsv() {
+    RideLogHeader header;
+    uint8_t slot = 0;
+    if (!requestedRide(header, slot)) return;
+    File file = LittleFS.open(ridePathForSlot(slot), "r");
+    if (!file || !file.seek(sizeof(RideLogHeader))) {
+        if (file) file.close();
+        server.send(500, "text/plain", "Unable to read ride telemetry");
+        return;
+    }
+
+    const String filename = "wheelie-ride-" + String(header.sessionId) + ".csv";
+    server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+    server.sendHeader("Cache-Control", "no-store");
+    server.sendHeader("X-Ride-SHA256", rideDigestHex(header.sampleSha256));
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/csv; charset=utf-8", "");
+    server.sendContent("# Wheelie Controller Ride Telemetry\r\n");
+    server.sendContent("# provenance=DEVICE-RECORDED; certification=none; integrity=SHA-256 sample checksum\r\n");
+    server.sendContent("# session_id=" + String(header.sessionId) +
+                       "; firmware=" + String(header.firmware) +
+                       "; commit=" + String(header.commit) +
+                       "; channel=" + String(header.channel) + "\r\n");
+    server.sendContent("# sample_sha256=" + rideDigestHex(header.sampleSha256) + "\r\n");
+    server.sendContent("elapsed_ms,pitch_deg,raw_pitch_deg,roll_deg,pitch_rate_dps,g_load,baseline_deg,output_percent,imu_ok,state,warning,baseline_frozen\r\n");
+
+    RideTelemetrySample sample;
+    char line[240];
+    uint32_t samplesSent = 0;
+    while (samplesSent < header.sampleCount &&
+           file.read(reinterpret_cast<uint8_t*>(&sample), sizeof(sample)) == sizeof(sample)) {
+        const char* state = (sample.flags & RIDE_SAMPLE_WHEELIE) ? "WHEELIE" :
+                            ((sample.flags & RIDE_SAMPLE_PENDING) ? "PENDING" : "NORMAL");
+        snprintf(line, sizeof(line),
+                 "%lu,%.2f,%.2f,%.2f,%.2f,%.3f,%.2f,%u,%u,%s,%u,%u\r\n",
+                 (unsigned long)sample.elapsedMs,
+                 sample.pitchCentiDeg / 100.0f,
+                 sample.rawPitchCentiDeg / 100.0f,
+                 sample.rollCentiDeg / 100.0f,
+                 sample.gyroCentiDegSec / 100.0f,
+                 sample.gLoadMillig / 1000.0f,
+                 (sample.rawPitchCentiDeg - sample.pitchCentiDeg) / 100.0f,
+                 sample.outputPercent,
+                 (sample.flags & RIDE_SAMPLE_IMU_OK) ? 1 : 0,
+                 state,
+                 (sample.flags & RIDE_SAMPLE_WARNING) ? 1 : 0,
+                 (sample.flags & RIDE_SAMPLE_BASELINE_FROZEN) ? 1 : 0);
+        server.sendContent(line);
+        samplesSent++;
+        if ((samplesSent % 100) == 0) delay(0);
+    }
+    file.close();
+    server.sendContent("");
+}
+
+void handleRideReport() {
+    RideLogHeader header;
+    uint8_t slot = 0;
+    if (!requestedRide(header, slot)) return;
+    const String digest = rideDigestHex(header.sampleSha256);
+    const String filename = "wheelie-ride-" + String(header.sessionId) + "-report.html";
+    server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+    server.sendHeader("Cache-Control", "no-store");
+
+    String report;
+    report.reserve(7000);
+    report = "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Ride Report #" + String(header.sessionId) + "</title><style>";
+    report += "body{margin:0;background:#080b10;color:#f4f7fb;font:15px system-ui,-apple-system,sans-serif}.wrap{width:min(760px,100%);margin:auto;padding:28px}.top{display:flex;justify-content:space-between;gap:20px;align-items:start}.kicker{color:#55e6ff;font-size:12px;letter-spacing:.16em}.badge{display:inline-grid;place-items:center;text-align:center;padding:12px 16px;border:2px solid #52df9a;border-radius:14px;color:#8dffc7;background:#102a21;font-weight:900;letter-spacing:.08em;transform:rotate(1deg)}.badge small{display:block;margin-top:4px;font-size:9px;color:#a9c6b8}.card{margin-top:18px;padding:18px;border:1px solid #273449;border-radius:16px;background:#111720}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:0 22px}.row{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #273449}.row span{color:#8f9bad}.hash{overflow-wrap:anywhere;font:12px ui-monospace,monospace;color:#9fb4c8}.note{color:#8f9bad;line-height:1.5;font-size:12px}@media print{body{background:white;color:#111}.card{background:white}.badge{color:#14663f;background:white}}@media(max-width:560px){.top{display:block}.badge{margin-top:16px}.grid{grid-template-columns:1fr}}";
+    report += "</style></head><body><main class=wrap><div class=top><div><div class=kicker>WHEELIE CONTROLLER</div><h1>Ride Report #" + String(header.sessionId) + "</h1><p>Hardware sensor telemetry captured at " + String(header.sampleRateHz) + " Hz.</p></div><div class=badge>DEVICE-RECORDED<small>SENSOR DATA · SHA-256</small></div></div>";
+    report += "<section class=card><h2>Ride summary</h2><div class=grid>";
+    report += "<div class=row><span>Duration</span><b>" + String(header.durationMs / 1000.0f, 1) + " s</b></div>";
+    report += "<div class=row><span>Samples</span><b>" + String(header.sampleCount) + "</b></div>";
+    report += "<div class=row><span>Wheelies</span><b>" + String(header.wheelieCount) + "</b></div>";
+    report += "<div class=row><span>Peak pitch</span><b>" + String(header.peakPitchCentiDeg / 100.0f, 1) + "°</b></div>";
+    report += "<div class=row><span>Peak lean</span><b>" + String(header.peakRollCentiDeg / 100.0f, 1) + "°</b></div>";
+    report += "<div class=row><span>Peak +G</span><b>" + String(header.peakGMillig / 1000.0f, 2) + " g</b></div></div></section>";
+    report += "<section class=card><h2>Recorder provenance</h2><div class=grid>";
+    report += "<div class=row><span>Firmware</span><b>" + String(header.firmware) + "</b></div>";
+    report += "<div class=row><span>Build commit</span><b>" + String(header.commit) + "</b></div>";
+    report += "<div class=row><span>Release channel</span><b>" + String(header.channel) + "</b></div>";
+    report += "<div class=row><span>Hardware</span><b>" + String(header.board) + "</b></div></div>";
+    report += "<p>Sample-stream SHA-256</p><div class=hash>" + digest + "</div></section>";
+    report += "<p class=note><b>What the badge means:</b> this report was generated from telemetry recorded by the controller hardware and includes a checksum for detecting accidental changes. It is not a third-party certification and is not yet a cryptographic device signature.</p>";
+    report += "<p class=note>Session start is recorded as controller uptime because the controller has no real-time clock. Downloaded <span id=downloaded></span>.</p><script>document.getElementById('downloaded').textContent=new Date().toLocaleString()</script></main></body></html>";
+    server.send(200, "text/html; charset=utf-8", report);
+}
+
 void handleSettings() {
     if (!requireWriteToken()) return;
 
@@ -1878,7 +2397,7 @@ void handleSettings() {
         "angleMode", "rotationAxis", "adaptiveTau", "freezeRate", "trigger", "reset",
         "hold", "minon", "brightness", "fade", "bootMode", "wheeliePattern",
         "warningPattern", "warningBrightness", "warningAngle", "warningReset", "warningRate",
-        "otaChannel"
+        "otaChannel", "rideLogging"
     };
 
     for (const char* key : required) {
@@ -1906,6 +2425,7 @@ void handleSettings() {
     float newWarningReset = server.arg("warningReset").toFloat();
     float newWarningRate = server.arg("warningRate").toFloat();
     String newOtaChannel = server.arg("otaChannel");
+    String newRideLogging = server.arg("rideLogging");
 
     if (angleMode != "absolute" && angleMode != "adaptive") {
         server.send(400, "text/plain", "Invalid angle mode");
@@ -1969,6 +2489,10 @@ void handleSettings() {
         server.send(400, "text/plain", "OTA channel must be stable or testing");
         return;
     }
+    if (newRideLogging != "enabled" && newRideLogging != "disabled") {
+        server.send(400, "text/plain", "Ride logging must be enabled or disabled");
+        return;
+    }
 
     if (newWheeliePattern < 0 || newWheeliePattern > 4 ||
         newWarningPattern < 0 || newWarningPattern > 4) {
@@ -2000,11 +2524,19 @@ void handleSettings() {
     settings.warningResetAngle = newWarningReset;
     settings.warningPitchRateDegSec = newWarningRate;
     otaChannel = newOtaChannel;
+    const bool wasRideLoggingEnabled = rideLoggingEnabled;
+    rideLoggingEnabled = newRideLogging == "enabled";
 
     controllerState = ControllerState::NORMAL;
     forceOutputOff();
     resetAdaptiveBaselineToCurrent();
     saveSettings();
+    if (wasRideLoggingEnabled && !rideLoggingEnabled) {
+        finishRideSession();
+    } else if (!wasRideLoggingEnabled && rideLoggingEnabled &&
+               operatingMode == OperatingMode::ARMED) {
+        startRideSession();
+    }
 
     oled.clearDisplay();
     displayDirty = true;
@@ -2514,6 +3046,9 @@ void registerWebRoutes() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/settings", HTTP_GET, handleSettingsPage);
     server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/rides", HTTP_GET, handleRideList);
+    server.on("/api/ride/report", HTTP_GET, handleRideReport);
+    server.on("/api/ride/csv", HTTP_GET, handleRideCsv);
     server.on("/api/settings", HTTP_POST, handleSettings);
     server.on("/api/mode", HTTP_POST, handleMode);
     server.on("/api/calibrate", HTTP_POST, handleCalibration);
@@ -2805,6 +3340,7 @@ void setup() {
     loadSettings();
     Serial.printf("Accepted OTA channel: %s\n", otaChannel.c_str());
     writeToken = makeWriteToken();
+    initializeRideLogging();
 
     // OLED initializes the shared I2C bus. Do not add Wire.begin().
     oled.begin();
@@ -2853,6 +3389,7 @@ void setup() {
     if (calibrated && settings.bootArmed) {
         operatingMode = OperatingMode::ARMED;
         resetAdaptiveBaselineToCurrent();
+        startRideSession();
     } else {
         operatingMode = OperatingMode::STANDBY;
         forceOutputOff();
@@ -2901,6 +3438,7 @@ void loop() {
         controllerState = ControllerState::NORMAL;
         forceOutputOff();
     }
+    updateRideLogging();
 
     updateDisplay();
     updateSerialStatus();
