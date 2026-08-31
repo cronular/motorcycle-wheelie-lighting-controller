@@ -35,7 +35,7 @@
 // FIRMWARE
 // =====================================================
 
-constexpr const char* FIRMWARE_VERSION = "v0.13.0-testing";
+constexpr const char* FIRMWARE_VERSION = "v0.13.0";
 constexpr const char* TARGET_BOARD_ID = "seeed_xiao_esp32s3";
 constexpr const char* TARGET_CHIP_ID = "esp32s3";
 

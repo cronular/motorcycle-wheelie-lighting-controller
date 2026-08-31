@@ -58,6 +58,7 @@ jobs:
           $package = "release/wheelie-controller-${{ github.ref_name }}.wctrl"
           python tools/package_firmware.py package --firmware .pio/build/seeed_xiao_esp32s3/firmware.bin --private-key $keyPath --output $package --version '${{ github.ref_name }}' --channel stable --commit '${{ github.sha }}' --built $built
           python tools/package_firmware.py verify --package $package --public-key security/firmware-signing-public.pem
+          Copy-Item .pio/build/seeed_xiao_esp32s3/firmware.bin "release/wheelie-controller-${{ github.ref_name }}-v0.11-migration.bin"
           $factory = '.pio/build/seeed_xiao_esp32s3/firmware.factory.bin'
           if (Test-Path -LiteralPath $factory) {
             Copy-Item -LiteralPath $factory "release/wheelie-controller-${{ github.ref_name }}-factory.bin"
@@ -73,6 +74,11 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
         with:
+          name: Wheelie Controller ${{ github.ref_name }}
+          body: |
+            ### Migrating from v0.11.0
+
+            Upload `wheelie-controller-${{ github.ref_name }}-v0.11-migration.bin` through the v0.11.0 Settings page as a one-time bridge. After the controller reboots, use signed `.wctrl` packages for future OTA updates. Verify the migration image against the signed `SHA256SUMS.txt` before uploading it.
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: release/*

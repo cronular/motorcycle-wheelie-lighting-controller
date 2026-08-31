@@ -53,9 +53,12 @@ jobs:
           $versionMatch = Select-String -Path src/main.cpp -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
           $version = $versionMatch.Matches[0].Groups[1].Value
           $built = (git show -s --format=%cI HEAD)
-          $package = "channel/wheelie-controller-$channel.wctrl"
+          $package = "channel/wheelie-controller-$version-$channel.wctrl"
           python tools/package_firmware.py package --firmware .pio/build/seeed_xiao_esp32s3/firmware.bin --private-key $keyPath --output $package --version $version --channel $channel --commit '${{ github.sha }}' --built $built
           python tools/package_firmware.py verify --package $package --public-key security/firmware-signing-public.pem
+          if ($channel -eq 'stable') {
+            Copy-Item .pio/build/seeed_xiao_esp32s3/firmware.bin "channel/wheelie-controller-$version-v0.11-migration.bin"
+          }
           Copy-Item security/firmware-signing-public.pem channel/firmware-signing-public.pem
           Get-ChildItem channel | ForEach-Object {
             $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
@@ -63,8 +66,25 @@ jobs:
           }
           python tools/package_firmware.py sign-file --file channel/SHA256SUMS.txt --private-key $keyPath --output channel/SHA256SUMS.txt.sig
           python tools/package_firmware.py verify-file --file channel/SHA256SUMS.txt --signature channel/SHA256SUMS.txt.sig --public-key security/firmware-signing-public.pem
+          $title = if ($channel -eq 'stable') { 'Stable' } else { 'Testing' }
+          $notes = @(
+            "Firmware version: **$version**",
+            '',
+            "Signed OTA package for the **$channel** channel and Seeed XIAO ESP32-S3."
+          )
+          if ($channel -eq 'stable') {
+            $notes += @(
+              '',
+              "### Migrating from v0.11.0",
+              '',
+              "Upload ``wheelie-controller-$version-v0.11-migration.bin`` through the v0.11.0 Settings page as a one-time bridge. After rebooting, use signed ``.wctrl`` packages for all future OTA updates. The migration image is included in the signed checksum list."
+            )
+          }
+          $notes | Set-Content channel-release-notes.md
           Remove-Item -LiteralPath $keyPath -Force
           "channel=$channel" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release_name=$title OTA channel - $version" >> $env:GITHUB_OUTPUT
       - name: Move rolling channel tag
         shell: pwsh
         run: |
@@ -73,11 +93,26 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git tag -f $tag $env:GITHUB_SHA
           git push origin "refs/tags/$tag" --force
+      - name: Remove assets from previous rolling build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "ota-${{ steps.package.outputs.channel }}"
+          $releaseJson = gh release view $tag --json assets 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $assets = ($releaseJson | ConvertFrom-Json).assets
+            foreach ($asset in $assets) {
+              gh release delete-asset $tag $asset.name --yes
+              if ($LASTEXITCODE -ne 0) { throw "Unable to remove stale release asset $($asset.name)" }
+            }
+          }
       - name: Publish rolling channel release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ota-${{ steps.package.outputs.channel }}
-          name: ${{ steps.package.outputs.channel == 'stable' && 'Stable OTA channel' || 'Testing OTA channel' }}
+          name: ${{ steps.package.outputs.release_name }}
+          body_path: channel-release-notes.md
           prerelease: ${{ steps.package.outputs.channel == 'testing' }}
           make_latest: false
           fail_on_unmatched_files: true

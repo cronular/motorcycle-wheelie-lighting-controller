@@ -29,3 +29,13 @@ python tools/configure_signing_secret.py `
 Signed `.wctrl` packages contain a manifest, its DER-encoded ECDSA signature,
 and the firmware image. The manifest binds the signature to the hardware target,
 release channel, version, commit, build date, image size, and SHA-256 digest.
+
+## v0.11.0 migration image
+
+Firmware v0.11.0 cannot parse or verify `.wctrl` packages. Stable channel and
+tagged releases therefore include a versioned `v0.11-migration.bin` containing
+the same application image as the signed stable package. It is a one-time bridge
+for the v0.11.0 dashboard's legacy raw-binary updater, not a general unsigned OTA
+path in current firmware. Its digest is included in `SHA256SUMS.txt`, and that
+checksum file is signed with the release key. After installing the bridge, the
+device accepts signed `.wctrl` packages only.
