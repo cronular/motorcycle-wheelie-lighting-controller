@@ -4,6 +4,7 @@
 #include <unity.h>
 #include "controller_core.h"
 #include "ride_log_format.h"
+#include "rider_model.h"
 
 void setUp() {}
 void tearDown() {}
@@ -124,6 +125,43 @@ void test_adaptive_baseline_freezes_during_fast_pitch_or_wheelie() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 23.0f, pitch);
 }
 
+void test_adaptive_baseline_reports_specific_freeze_reasons() {
+    ControllerSettings s;
+    s.angleMode = AngleMode::ADAPTIVE;
+    float baseline = 0.0f;
+    bool frozen = false;
+    AdaptiveFreezeReason reason = AdaptiveFreezeReason::NONE;
+
+    processTriggerPitch(5.0f, 0.0f, 0.01f, false, true, s,
+        baseline, frozen, &reason);
+    TEST_ASSERT_EQUAL_INT((int)AdaptiveFreezeReason::IMU_UNHEALTHY, (int)reason);
+    processTriggerPitch(5.0f, 0.0f, 0.01f, true, false, s,
+        baseline, frozen, &reason);
+    TEST_ASSERT_EQUAL_INT((int)AdaptiveFreezeReason::CONTROLLER_ACTIVE, (int)reason);
+    processTriggerPitch(5.0f, 9.0f, 0.01f, true, true, s,
+        baseline, frozen, &reason);
+    TEST_ASSERT_EQUAL_INT((int)AdaptiveFreezeReason::MOTION, (int)reason);
+    processTriggerPitch(5.0f, 0.0f, 0.01f, true, true, s,
+        baseline, frozen, &reason, 0.0f);
+    TEST_ASSERT_EQUAL_INT((int)AdaptiveFreezeReason::ACCELERATION, (int)reason);
+}
+
+void test_time_based_attitude_filter_rejects_external_acceleration() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.98f, timeConstantGyroWeight(0.49f, 0.01f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.0f, calculateAccelerationTrust(1.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, calculateAccelerationTrust(1.2f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.0f,
+        updateAdaptiveComplementaryAngle(0.0f, 100.0f, 40.0f, 0.01f, 0.0f));
+    TEST_ASSERT_TRUE(
+        updateAdaptiveComplementaryAngle(0.0f, 0.0f, 40.0f, 0.01f, 1.0f) > 0.0f);
+}
+
+void test_noise_aware_freeze_rate_is_bounded() {
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 8.0f, calculateNoiseAwareFreezeRate(8.0f, 1.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 12.0f, calculateNoiseAwareFreezeRate(8.0f, 4.0f));
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 25.0f, calculateNoiseAwareFreezeRate(8.0f, 20.0f));
+}
+
 void test_warning_angle_hysteresis() {
     ControllerSettings s;
     bool warning = false;
@@ -152,6 +190,46 @@ void test_light_patterns() {
     TEST_ASSERT_EQUAL_UINT8(0, calculatePatternBrightness(LightPattern::STROBE, 200, 95));
     TEST_ASSERT_EQUAL_UINT8(36, calculatePatternBrightness(LightPattern::SLOW_PULSE, 200, 0));
     TEST_ASSERT_EQUAL_UINT8(200, calculatePatternBrightness(LightPattern::SLOW_PULSE, 200, 800));
+}
+
+void test_warning_off_does_not_suppress_wheelie_output() {
+    TEST_ASSERT_EQUAL_UINT8(180, calculateRequestedBrightness(
+        true, true, LightPattern::OFF, 255,
+        LightPattern::SOLID, 180, 100));
+    TEST_ASSERT_EQUAL_UINT8(220, calculateRequestedBrightness(
+        true, true, LightPattern::SOLID, 220,
+        LightPattern::SOLID, 180, 100));
+    TEST_ASSERT_EQUAL_UINT8(0, calculateRequestedBrightness(
+        true, false, LightPattern::OFF, 255,
+        LightPattern::SOLID, 180, 100));
+}
+
+void test_rider_profile_and_shadow_event_are_bounded() {
+    TEST_ASSERT_FALSE(RIDER_MODEL_DEFAULT_ENABLED);
+    RiderProfile profile;
+    updateStableRiderProfile(profile, -1.0f, 0.01f);
+    updateStableRiderProfile(profile, 1.0f, 0.03f);
+    TEST_ASSERT_EQUAL_UINT32(2, profile.stableSamples);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.4142f, riderProfileGyroRms(profile));
+
+    ModelEventAccumulator accumulator;
+    beginModelEvent(accumulator, 7, 1000);
+    addModelEventSample(accumulator, 1000, 0.0f, 0.0f, 0.0f, 2.0f, false, 20.0f);
+    addModelEventSample(accumulator, 1020, 25.0f, 60.0f, 0.4f, 4.0f, true, 20.0f);
+    ModelEventFeatures event = finishModelEvent(
+        accumulator, 1040, ModelEventOutcome::DETECTED);
+    TEST_ASSERT_EQUAL_UINT32(7, event.id);
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 25.0f, event.pitchRise);
+    TEST_ASSERT_TRUE(event.shadowScore > 0.0f && event.shadowScore < 1.0f);
+
+    ModelEventHistory history;
+    for (uint32_t id = 1; id <= EVENT_HISTORY_CAPACITY + 2; ++id) {
+        event.id = id;
+        appendModelEvent(history, event);
+    }
+    TEST_ASSERT_EQUAL_UINT8(EVENT_HISTORY_CAPACITY, history.count);
+    TEST_ASSERT_EQUAL_UINT32(EVENT_HISTORY_CAPACITY + 3, history.nextId);
+    TEST_ASSERT_NOT_NULL(findModelEvent(history, EVENT_HISTORY_CAPACITY + 2));
 }
 
 void test_fade_interpolation() {
@@ -327,9 +405,14 @@ static void runAllTests() {
     RUN_TEST(test_absolute_angle_processing);
     RUN_TEST(test_adaptive_baseline_tracks_slow_terrain);
     RUN_TEST(test_adaptive_baseline_freezes_during_fast_pitch_or_wheelie);
+    RUN_TEST(test_adaptive_baseline_reports_specific_freeze_reasons);
+    RUN_TEST(test_time_based_attitude_filter_rejects_external_acceleration);
+    RUN_TEST(test_noise_aware_freeze_rate_is_bounded);
     RUN_TEST(test_warning_angle_hysteresis);
     RUN_TEST(test_warning_pitch_rate_early_trigger_and_release);
     RUN_TEST(test_light_patterns);
+    RUN_TEST(test_warning_off_does_not_suppress_wheelie_output);
+    RUN_TEST(test_rider_profile_and_shadow_event_are_bounded);
     RUN_TEST(test_fade_interpolation);
     RUN_TEST(test_full_wheelie_profile);
     RUN_TEST(test_orientation_detects_z_vertical_x_roll_y_pitch);

@@ -33,7 +33,7 @@ jobs:
           $env:BUILD_DATE = (git show -s --format=%cI HEAD)
           $env:RELEASE_CHANNEL = if ('${{ github.ref_name }}' -eq 'main') { 'stable' } else { 'testing' }
           pio test -e native
-          python -m unittest discover -s test -p test_package_firmware.py
+          python -m unittest discover -s test -p "test_*.py"
           python tools/check_embedded_web.py
           python tools/run_simulator.py --check
           pio run -e seeed_xiao_esp32s3

@@ -17,6 +17,7 @@
 #include <Update.h>
 #include "controller_core.h"
 #include "ride_log_format.h"
+#include "rider_model.h"
 #include "firmware_signing_key.h"
 #include "build_metadata.generated.h"
 
@@ -35,7 +36,7 @@
 // FIRMWARE
 // =====================================================
 
-constexpr const char* FIRMWARE_VERSION = "v0.13.0";
+constexpr const char* FIRMWARE_VERSION = "v0.14.0";
 constexpr const char* TARGET_BOARD_ID = "seeed_xiao_esp32s3";
 constexpr const char* TARGET_CHIP_ID = "esp32s3";
 
@@ -178,7 +179,8 @@ constexpr float ACCEL_LSB_PER_G = 8192.0f;
 // PITCH FILTER
 // =====================================================
 
-constexpr float FILTER_ALPHA = 0.98f;
+constexpr float ATTITUDE_FILTER_TIME_CONSTANT_SEC = 0.49f;
+constexpr float GYRO_RATE_FILTER_TIME_CONSTANT_SEC = 0.04f;
 constexpr float PITCH_SIGN = -1.0f; // front rising = positive
 
 // =====================================================
@@ -275,8 +277,12 @@ float adaptiveBaseline = 0.0f;
 float currentTriggerPitch = 0.0f;
 
 float currentGyroRate = 0.0f;
+float currentFilteredGyroRate = 0.0f;
 float currentRollAngle = 0.0f;
 float currentRollRate = 0.0f;
+float currentAccelerationTrust = 1.0f;
+float currentAccelerationMagnitude = 1.0f;
+float effectiveAdaptiveFreezeRate = 8.0f;
 
 // Live acceleration telemetry. v0.11 reports +G as dynamic linear
 // acceleration with the gravity vector removed, so a stationary bike
@@ -306,6 +312,7 @@ float highestAngle = 0.0f;
 float highestGLoad = 0.0f;
 
 bool adaptiveBaselineFrozen = false;
+AdaptiveFreezeReason adaptiveFreezeReason = AdaptiveFreezeReason::NONE;
 
 bool imuHealthy = false;
 int imuFailureCount = 0;
@@ -341,6 +348,7 @@ bool displayDirty = true;
 
 bool rideStorageReady = false;
 bool rideLoggingEnabled = RIDE_LOG_DEFAULT_ENABLED;
+bool riderModelEnabled = RIDER_MODEL_DEFAULT_ENABLED;
 bool rideSessionActive = false;
 bool rideHashInitialized = false;
 File rideFile;
@@ -351,6 +359,39 @@ uint32_t rideSessionStartMs = 0;
 uint32_t rideNextSampleMs = 0;
 uint32_t rideWheelieStartCount = 0;
 uint16_t rideSamplesSinceFlush = 0;
+
+// =====================================================
+// RIDER MODEL / HIGH-RATE EVENT FEATURES
+// =====================================================
+
+constexpr uint16_t MODEL_SAMPLE_RATE_HZ = 50;
+constexpr uint32_t MODEL_SAMPLE_INTERVAL_MS = 1000 / MODEL_SAMPLE_RATE_HZ;
+constexpr uint16_t MODEL_PRE_EVENT_SAMPLES = MODEL_SAMPLE_RATE_HZ * 2;
+constexpr uint32_t MODEL_POST_EVENT_MS = 2000;
+constexpr uint32_t MODEL_PROFILE_SAVE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+
+struct ModelRawSample {
+    uint32_t timeMs = 0;
+    float pitch = 0.0f;
+    float pitchRate = 0.0f;
+    float gLoad = 0.0f;
+    float roll = 0.0f;
+    bool baselineFrozen = false;
+};
+
+RiderProfile riderProfile;
+ModelEventHistory modelEventHistory;
+ModelEventAccumulator modelEventAccumulator;
+ModelRawSample modelPreEventRing[MODEL_PRE_EVENT_SAMPLES];
+uint16_t modelPreEventHead = 0;
+uint16_t modelPreEventCount = 0;
+uint32_t modelNextSampleMs = 0;
+uint32_t modelFinishAtMs = 0;
+uint32_t modelLastProfileSaveMs = 0;
+ModelEventOutcome modelPendingOutcome = ModelEventOutcome::CANCELLED;
+ControllerState modelPreviousControllerState = ControllerState::NORMAL;
+bool modelFinishPending = false;
+bool riderModelDirty = false;
 
 // =====================================================
 // FORWARD DECLARATIONS
@@ -372,6 +413,9 @@ void initializeRideLogging();
 void startRideSession();
 void finishRideSession(bool capacityReached = false);
 void updateRideLogging();
+void loadRiderModel();
+void saveRiderModel();
+void updateRiderModel();
 
 // =====================================================
 // STRING HELPERS
@@ -392,6 +436,36 @@ const char* getModeName() {
 
 const char* getAngleModeName() {
     return settings.angleMode == AngleMode::ADAPTIVE ? "ADAPTIVE" : "ABSOLUTE";
+}
+
+const char* getAdaptiveFreezeReasonName() {
+    switch (adaptiveFreezeReason) {
+        case AdaptiveFreezeReason::NONE: return "TRACKING";
+        case AdaptiveFreezeReason::IMU_UNHEALTHY: return "HOLD: IMU";
+        case AdaptiveFreezeReason::CONTROLLER_ACTIVE: return "HOLD: STATE";
+        case AdaptiveFreezeReason::MOTION: return "HOLD: MOTION";
+        case AdaptiveFreezeReason::ACCELERATION: return "HOLD: ACCEL";
+    }
+    return "HOLD";
+}
+
+const char* getModelOutcomeName(ModelEventOutcome outcome) {
+    switch (outcome) {
+        case ModelEventOutcome::CANCELLED: return "cancelled";
+        case ModelEventOutcome::DETECTED: return "detected";
+        case ModelEventOutcome::MISSED: return "missed";
+    }
+    return "unknown";
+}
+
+const char* getModelLabelName(ModelEventLabel label) {
+    switch (label) {
+        case ModelEventLabel::UNLABELED: return "unlabeled";
+        case ModelEventLabel::CORRECT: return "correct";
+        case ModelEventLabel::FALSE_TRIGGER: return "false";
+        case ModelEventLabel::MISSED: return "missed";
+    }
+    return "unlabeled";
 }
 
 // =====================================================
@@ -459,6 +533,7 @@ void loadSettings() {
     wifiApSsid = preferences.getString("apssid", "");
     otaChannel = preferences.getString("otachannel", RELEASE_CHANNEL);
     rideLoggingEnabled = preferences.getBool("ridelog", RIDE_LOG_DEFAULT_ENABLED);
+    riderModelEnabled = preferences.getBool("ridermodel", RIDER_MODEL_DEFAULT_ENABLED);
 
     preferences.end();
 
@@ -523,6 +598,7 @@ void saveSettings() {
     preferences.putString("wifipass", wifiApPassword);
     preferences.putString("otachannel", otaChannel);
     preferences.putBool("ridelog", rideLoggingEnabled);
+    preferences.putBool("ridermodel", riderModelEnabled);
 
     preferences.end();
     Serial.println("Settings saved to NVS");
@@ -856,7 +932,8 @@ void drawDiagnosticsPage() {
     snprintf(line, sizeof(line), "+G:%.2fg", currentGLoad);
     oledPrintRow(5, line);
 
-    snprintf(line, sizeof(line), "BASE:%s", adaptiveBaselineFrozen ? "FROZEN" : "TRACKING");
+    snprintf(line, sizeof(line), "BASE:%s",
+             adaptiveBaselineFrozen ? getAdaptiveFreezeReasonName() + 6 : "TRACKING");
     oledPrintRow(6, line);
 
     snprintf(line, sizeof(line), "IMU:%s", imuHealthy ? "OK" : "FAULT");
@@ -1207,9 +1284,15 @@ bool calibrateMPU() {
     adaptiveBaseline = 0.0f;
     currentTriggerPitch = 0.0f;
     currentGyroRate = 0.0f;
+    currentFilteredGyroRate = 0.0f;
     currentRollAngle = 0.0f;
     currentRollRate = 0.0f;
+    currentAccelerationTrust = 1.0f;
+    currentAccelerationMagnitude = 1.0f;
+    effectiveAdaptiveFreezeRate = calculateNoiseAwareFreezeRate(
+        settings.adaptiveFreezeRateDegSec, calibrationGyroNoiseRms);
     adaptiveBaselineFrozen = false;
+    adaptiveFreezeReason = AdaptiveFreezeReason::NONE;
 
     imuHealthy = true;
     imuFailureCount = 0;
@@ -1247,6 +1330,7 @@ void resetAdaptiveBaselineToCurrent() {
     }
 
     adaptiveBaselineFrozen = false;
+    adaptiveFreezeReason = AdaptiveFreezeReason::NONE;
 }
 
 void updateAngleProcessing(float dt) {
@@ -1256,10 +1340,168 @@ void updateAngleProcessing(float dt) {
         operatingMode == OperatingMode::ARMED &&
         controllerState == ControllerState::NORMAL;
     currentTriggerPitch = processTriggerPitch(
-        currentAbsolutePitch, currentGyroRate, dt, imuHealthy,
+        currentAbsolutePitch, currentFilteredGyroRate, dt, imuHealthy,
         controllerAllowsTracking, settings, adaptiveBaseline,
-        adaptiveBaselineFrozen);
+        adaptiveBaselineFrozen, &adaptiveFreezeReason,
+        currentAccelerationTrust, effectiveAdaptiveFreezeRate);
     if (currentTriggerPitch > highestAngle) highestAngle = currentTriggerPitch;
+}
+
+// =====================================================
+// RIDER PROFILE / SHADOW EVENT MODEL
+// =====================================================
+
+void loadRiderModel() {
+    preferences.begin("wheelie", true);
+    if (preferences.getBytesLength("rprofile") == sizeof(RiderProfile)) {
+        preferences.getBytes("rprofile", &riderProfile, sizeof(riderProfile));
+    }
+    if (preferences.getBytesLength("evthist") == sizeof(ModelEventHistory)) {
+        preferences.getBytes("evthist", &modelEventHistory, sizeof(modelEventHistory));
+    }
+    preferences.end();
+
+    if (!isRiderProfileValid(riderProfile)) {
+        memset(&riderProfile, 0, sizeof(riderProfile));
+        riderProfile.magic = RIDER_PROFILE_MAGIC;
+        riderProfile.version = RIDER_PROFILE_VERSION;
+        riderProfile.size = sizeof(RiderProfile);
+    }
+    if (!isModelEventHistoryValid(modelEventHistory)) {
+        memset(&modelEventHistory, 0, sizeof(modelEventHistory));
+        modelEventHistory.magic = EVENT_HISTORY_MAGIC;
+        modelEventHistory.version = EVENT_HISTORY_VERSION;
+        modelEventHistory.size = sizeof(ModelEventHistory);
+        modelEventHistory.nextId = 1;
+    }
+    effectiveAdaptiveFreezeRate = calculateNoiseAwareFreezeRate(
+        settings.adaptiveFreezeRateDegSec, calibrationGyroNoiseRms);
+    modelPreviousControllerState = controllerState;
+    Serial.printf(
+        "Rider model ready: %lu stable samples, %lu labels, %u recent events\n",
+        (unsigned long)riderProfile.stableSamples,
+        (unsigned long)(riderProfile.labeledCorrect + riderProfile.labeledFalse +
+            riderProfile.labeledMissed),
+        modelEventHistory.count);
+}
+
+void saveRiderModel() {
+    if (!riderModelDirty) return;
+    preferences.begin("wheelie", false);
+    preferences.putBytes("rprofile", &riderProfile, sizeof(riderProfile));
+    preferences.putBytes("evthist", &modelEventHistory, sizeof(modelEventHistory));
+    preferences.end();
+    riderModelDirty = false;
+    modelLastProfileSaveMs = millis();
+}
+
+float recommendedRiderFreezeRate() {
+    return calculateNoiseAwareFreezeRate(
+        settings.adaptiveFreezeRateDegSec,
+        fmaxf(calibrationGyroNoiseRms, riderProfileGyroRms(riderProfile)));
+}
+
+void addCurrentModelSample(ModelEventAccumulator& accumulator, uint32_t now) {
+    addModelEventSample(
+        accumulator, now, currentTriggerPitch, currentFilteredGyroRate,
+        currentGLoad, currentRollAngle, adaptiveBaselineFrozen,
+        settings.triggerAngle);
+}
+
+void beginCapturedModelEvent(uint32_t now) {
+    if (modelEventAccumulator.active) return;
+    const uint16_t oldest = (uint16_t)(
+        (modelPreEventHead + MODEL_PRE_EVENT_SAMPLES - modelPreEventCount) %
+        MODEL_PRE_EVENT_SAMPLES);
+    const uint32_t startedMs = modelPreEventCount > 0
+        ? modelPreEventRing[oldest].timeMs : now;
+    beginModelEvent(modelEventAccumulator, modelEventHistory.nextId, startedMs);
+    for (uint16_t logical = 0; logical < modelPreEventCount; ++logical) {
+        const ModelRawSample& sample = modelPreEventRing[
+            (oldest + logical) % MODEL_PRE_EVENT_SAMPLES];
+        addModelEventSample(
+            modelEventAccumulator, sample.timeMs, sample.pitch, sample.pitchRate,
+            sample.gLoad, sample.roll, sample.baselineFrozen,
+            settings.triggerAngle);
+    }
+    modelPendingOutcome = ModelEventOutcome::CANCELLED;
+    modelFinishPending = false;
+}
+
+void finalizeCapturedModelEvent(uint32_t now) {
+    if (!modelEventAccumulator.active) return;
+    ModelEventFeatures event = finishModelEvent(
+        modelEventAccumulator, now, modelPendingOutcome);
+    event.rideSessionId = rideSessionActive ? activeRideHeader.sessionId : 0;
+    appendModelEvent(modelEventHistory, event);
+    riderModelDirty = true;
+    modelFinishPending = false;
+    Serial.printf(
+        "Shadow event #%lu: %s score=%.2f rise=%.1f rate=%.1f samples=%u\n",
+        (unsigned long)event.id, getModelOutcomeName(event.outcome),
+        event.shadowScore, event.pitchRise, event.peakPitchRate,
+        event.sampleCount);
+}
+
+void updateRiderModel() {
+    const uint32_t now = millis();
+    if (!riderModelEnabled) {
+        modelPreviousControllerState = controllerState;
+        return;
+    }
+    if ((int32_t)(now - modelNextSampleMs) < 0) return;
+    modelNextSampleMs = now + MODEL_SAMPLE_INTERVAL_MS;
+
+    const bool transitionedToPending =
+        modelPreviousControllerState == ControllerState::NORMAL &&
+        controllerState == ControllerState::TRIGGER_PENDING;
+    if (transitionedToPending) {
+        if (modelEventAccumulator.active) finalizeCapturedModelEvent(now);
+        beginCapturedModelEvent(now);
+    }
+    if (modelPreviousControllerState == ControllerState::TRIGGER_PENDING &&
+        controllerState == ControllerState::WHEELIE) {
+        modelPendingOutcome = ModelEventOutcome::DETECTED;
+    }
+    if (modelEventAccumulator.active &&
+        modelPreviousControllerState != ControllerState::NORMAL &&
+        controllerState == ControllerState::NORMAL) {
+        modelFinishPending = true;
+        modelFinishAtMs = now + MODEL_POST_EVENT_MS;
+    }
+
+    ModelRawSample& ringSample = modelPreEventRing[modelPreEventHead];
+    ringSample.timeMs = now;
+    ringSample.pitch = currentTriggerPitch;
+    ringSample.pitchRate = currentFilteredGyroRate;
+    ringSample.gLoad = currentGLoad;
+    ringSample.roll = currentRollAngle;
+    ringSample.baselineFrozen = adaptiveBaselineFrozen;
+    modelPreEventHead = (uint16_t)((modelPreEventHead + 1) % MODEL_PRE_EVENT_SAMPLES);
+    if (modelPreEventCount < MODEL_PRE_EVENT_SAMPLES) modelPreEventCount++;
+
+    if (modelEventAccumulator.active) addCurrentModelSample(modelEventAccumulator, now);
+
+    const bool stableForProfile = imuHealthy &&
+        operatingMode == OperatingMode::ARMED &&
+        controllerState == ControllerState::NORMAL &&
+        currentAccelerationTrust >= 0.80f &&
+        fabsf(currentFilteredGyroRate) < 2.0f;
+    if (stableForProfile) {
+        updateStableRiderProfile(
+            riderProfile, currentFilteredGyroRate,
+            fabsf(currentAccelerationMagnitude - 1.0f));
+        riderModelDirty = true;
+    }
+
+    if (modelFinishPending && (int32_t)(now - modelFinishAtMs) >= 0) {
+        finalizeCapturedModelEvent(now);
+    }
+    if (riderModelDirty &&
+        (uint32_t)(now - modelLastProfileSaveMs) >= MODEL_PROFILE_SAVE_INTERVAL_MS) {
+        saveRiderModel();
+    }
+    modelPreviousControllerState = controllerState;
 }
 
 // =====================================================
@@ -1521,6 +1763,7 @@ void setOperatingMode(OperatingMode mode) {
     const OperatingMode previousMode = operatingMode;
     if (previousMode == OperatingMode::ARMED && mode != OperatingMode::ARMED) {
         finishRideSession();
+        saveRiderModel();
     }
     operatingMode = mode;
     controllerState = ControllerState::NORMAL;
@@ -1587,11 +1830,13 @@ void toggleAngleModeFromButton() {
         adaptiveBaseline = currentAbsolutePitch;
         currentTriggerPitch = 0.0f;
         adaptiveBaselineFrozen = false;
+        adaptiveFreezeReason = AdaptiveFreezeReason::NONE;
     } else {
         settings.angleMode = AngleMode::ABSOLUTE;
         adaptiveBaseline = 0.0f;
         currentTriggerPitch = currentAbsolutePitch;
         adaptiveBaselineFrozen = false;
+        adaptiveFreezeReason = AdaptiveFreezeReason::NONE;
     }
 
     // Button-selected angle mode is persistent, just like a web change.
@@ -1720,13 +1965,9 @@ void updateButton() {
 // WHEELIE STATE MACHINE
 // =====================================================
 
-uint8_t patternBrightness(LightPattern pattern, uint8_t brightness, unsigned long now) {
-    return calculatePatternBrightness(pattern, brightness, now);
-}
-
 void updateHighAngleWarning(float triggerPitch) {
     highAngleWarningActive = stepHighAngleWarning(
-        highAngleWarningActive, triggerPitch, currentGyroRate, settings);
+        highAngleWarningActive, triggerPitch, currentFilteredGyroRate, settings);
 }
 
 void updateController(float triggerPitch) {
@@ -1769,14 +2010,10 @@ void updateController(float triggerPitch) {
         lastWheeliePeakG = activeWheeliePeakG;
     }
 
-    uint8_t requestedBrightness = 0;
-    if (highAngleWarningActive) {
-        requestedBrightness = patternBrightness(
-            settings.warningPattern, settings.warningBrightness, millis());
-    } else if (outputOn) {
-        requestedBrightness = patternBrightness(
-            settings.wheeliePattern, settings.brightness, millis());
-    }
+    const uint8_t requestedBrightness = calculateRequestedBrightness(
+        highAngleWarningActive, outputOn,
+        settings.warningPattern, settings.warningBrightness,
+        settings.wheeliePattern, settings.brightness, millis());
     setOutputTarget(requestedBrightness, true);
     if (controllerState != previousState) displayDirty = true;
 }
@@ -2027,7 +2264,7 @@ function updateModeHold(now){if(!modeHoldStarted||!modeHoldButton)return;const p
 function bindModeHold(button){button.addEventListener('pointerdown',e=>{if(e.button!==0||button.disabled)return;clearModeHold();modeHoldButton=button;modeHoldStarted=performance.now();button.classList.add('holding');if(button.setPointerCapture)button.setPointerCapture(e.pointerId);modeHoldFrame=requestAnimationFrame(updateModeHold)});button.addEventListener('pointerup',clearModeHold);button.addEventListener('pointercancel',clearModeHold);button.addEventListener('contextmenu',e=>e.preventDefault());button.addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&!e.repeat){e.preventDefault();if(confirm('Change controller mode?'))toggleMode()}})}
 modeButtons.forEach(bindModeHold);
 $('calibrateButton').addEventListener('click',recalibrateFromTile);
-async function refresh(){if(refreshBusy)return;refreshBusy=true;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('status');const d=await r.json();token=d.token;lastStatusAt=performance.now();$('staleBanner').classList.remove('active');setText('pitch',d.pitch.toFixed(1)+'°');setText('rawPitch',d.rawPitch.toFixed(1)+'°');setText('baseline',d.baseline.toFixed(1)+'°');setText('triggerPitch',d.pitch.toFixed(1)+'°');setText('raw2',d.rawPitch.toFixed(1)+'°');setText('base2',d.baseline.toFixed(1)+'°');setText('trig2',d.pitch.toFixed(1)+'°');setText('state',d.state);$('state').className=d.state==='WHEELIE'?'statusGood':d.state==='PENDING'?'statusWarn':'';setText('mode',d.mode);setText('output',d.output+'%');setText('imu',d.imu?'OK':'FAULT');$('imu').className=d.imu?'statusGood':'statusBad';setText('baselineState',d.angleMode==='adaptive'?(d.baselineFrozen?'FROZEN':'TRACKING'):'FIXED');setText('angleModeLine',d.angleMode.toUpperCase()+' angle mode');setText('gyro',d.gyroRate.toFixed(1)+'°/s');setText('gload',plusG(d.gLoad));setText('peakAngle',d.peakAngle.toFixed(1)+'°');setText('peakG',plusG(d.peakG));setText('threshold',d.trigger.toFixed(1)+'°');setText('rollValue',d.roll.toFixed(1)+'°');setText('rollRateValue',d.rollRate.toFixed(1)+'°/s');setText('leanHud',(d.roll>0?'+':'')+d.roll.toFixed(1)+'°');setText('eventCount',d.eventCount);setText('activeDuration',(d.activeDuration/1000).toFixed(1)+' s');setText('lastDuration',(d.lastDuration/1000).toFixed(1)+' s');setText('lastEventPeak',d.lastPeakAngle.toFixed(1)+'° · +'+d.lastPeakG.toFixed(2)+' g');const armed=d.mode==='ARMED';setText('quickMode',d.mode);$('quickModeChip').classList.toggle('modeArmed',armed);$('quickModeChip').classList.toggle('modeStandby',!armed);setText('quickConnection','LIVE');$('quickConnectionChip').className='safetyChip connected';setText('quickOutput',d.output+'%');const logText=!d.rideLoggingAvailable?'UNAVAILABLE':d.rideLoggingActive?'REC '+rideDuration(d.rideSampleCount/d.rideSampleRateHz*1000):d.rideLoggingEnabled?'READY':'OFF';setText('quickLog',logText);$('quickLogChip').className='safetyChip '+(d.rideLoggingActive?'recording':d.rideLoggingEnabled?'loggingReady':'');$('warningRibbon').classList.toggle('on',d.warningActive);$('warningMarker').style.top='calc(50% - '+clamp(d.warningAngle,-60,60)*3+'px)';$('triggerMarker').style.top='calc(50% - '+clamp(d.trigger,-60,60)*3+'px)';$('hudHorizon').style.transform='rotate('+(-clamp(d.roll,-45,45))+'deg)';$('leanDot').style.transform='translate(calc(-50% + '+(clamp(d.roll,-50,50)/50*65)+'px),-50%)';gyroBar(d.gyroRate);$('gFill').style.width=clamp(d.gLoad/2*100,0,100)+'%';$('pitchFill').style.width=clamp(Math.max(0,d.pitch)/Math.max(1,d.trigger)*100,0,100)+'%';$('bikeWrap').style.transform='translate(-50%,-50%) rotate('+(-clamp(d.rawPitch,-55,55))+'deg)';$('connDot').style.background='var(--green)';setText('connText','Connected');if(performance.now()-lastGraphAt>=200){lastGraphAt=performance.now();drawRideGraph(d)}}catch(e){$('connDot').style.background='var(--red)';setText('connText','Disconnected');setText('quickConnection','LOST');$('quickConnectionChip').className='safetyChip disconnected';$('staleBanner').classList.add('active')}finally{refreshBusy=false}}
+async function refresh(){if(refreshBusy)return;refreshBusy=true;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw new Error('status');const d=await r.json();token=d.token;lastStatusAt=performance.now();$('staleBanner').classList.remove('active');setText('pitch',d.pitch.toFixed(1)+'°');setText('rawPitch',d.rawPitch.toFixed(1)+'°');setText('baseline',d.baseline.toFixed(1)+'°');setText('triggerPitch',d.pitch.toFixed(1)+'°');setText('raw2',d.rawPitch.toFixed(1)+'°');setText('base2',d.baseline.toFixed(1)+'°');setText('trig2',d.pitch.toFixed(1)+'°');setText('state',d.state);$('state').className=d.state==='WHEELIE'?'statusGood':d.state==='PENDING'?'statusWarn':'';setText('mode',d.mode);setText('output',d.output+'%');setText('imu',d.imu?'OK':'FAULT');$('imu').className=d.imu?'statusGood':'statusBad';setText('baselineState',d.angleMode==='adaptive'?d.baselineState:'FIXED');setText('angleModeLine',d.angleMode.toUpperCase()+' angle mode');setText('gyro',d.filteredGyroRate.toFixed(1)+'°/s');setText('gload',plusG(d.gLoad));setText('peakAngle',d.peakAngle.toFixed(1)+'°');setText('peakG',plusG(d.peakG));setText('threshold',d.trigger.toFixed(1)+'°');setText('rollValue',d.roll.toFixed(1)+'°');setText('rollRateValue',d.rollRate.toFixed(1)+'°/s');setText('leanHud',(d.roll>0?'+':'')+d.roll.toFixed(1)+'°');setText('eventCount',d.eventCount);setText('activeDuration',(d.activeDuration/1000).toFixed(1)+' s');setText('lastDuration',(d.lastDuration/1000).toFixed(1)+' s');setText('lastEventPeak',d.lastPeakAngle.toFixed(1)+'° · +'+d.lastPeakG.toFixed(2)+' g');const armed=d.mode==='ARMED';setText('quickMode',d.mode);$('quickModeChip').classList.toggle('modeArmed',armed);$('quickModeChip').classList.toggle('modeStandby',!armed);setText('quickConnection','LIVE');$('quickConnectionChip').className='safetyChip connected';setText('quickOutput',d.output+'%');const logText=!d.rideLoggingAvailable?'UNAVAILABLE':d.rideLoggingActive?'REC '+rideDuration(d.rideSampleCount/d.rideSampleRateHz*1000):d.rideLoggingEnabled?'READY':'OFF';setText('quickLog',logText);$('quickLogChip').className='safetyChip '+(d.rideLoggingActive?'recording':d.rideLoggingEnabled?'loggingReady':'');$('warningRibbon').classList.toggle('on',d.warningActive);$('warningMarker').style.top='calc(50% - '+clamp(d.warningAngle,-60,60)*3+'px)';$('triggerMarker').style.top='calc(50% - '+clamp(d.trigger,-60,60)*3+'px)';$('hudHorizon').style.transform='rotate('+(-clamp(d.roll,-45,45))+'deg)';$('leanDot').style.transform='translate(calc(-50% + '+(clamp(d.roll,-50,50)/50*65)+'px),-50%)';gyroBar(d.filteredGyroRate);$('gFill').style.width=clamp(d.gLoad/2*100,0,100)+'%';$('pitchFill').style.width=clamp(Math.max(0,d.pitch)/Math.max(1,d.trigger)*100,0,100)+'%';$('bikeWrap').style.transform='translate(-50%,-50%) rotate('+(-clamp(d.rawPitch,-55,55))+'deg)';$('connDot').style.background='var(--green)';setText('connText','Connected');if(performance.now()-lastGraphAt>=200){lastGraphAt=performance.now();drawRideGraph(d)}}catch(e){$('connDot').style.background='var(--red)';setText('connText','Disconnected');setText('quickConnection','LOST');$('quickConnectionChip').className='safetyChip disconnected';$('staleBanner').classList.add('active')}finally{refreshBusy=false}}
 function updateStaleState(){if(lastStatusAt&&performance.now()-lastStatusAt>1500){$('staleBanner').classList.add('active');setText('quickConnection','STALE');$('quickConnectionChip').className='safetyChip disconnected'}}
 async function resetPeak(kind){if(!token||!confirm('Reset the highest '+(kind==='g'?'+G load':'angle')+' value?'))return;try{await fetch('/api/peak/reset?token='+encodeURIComponent(token)+'&kind='+encodeURIComponent(kind),{method:'POST'});refresh()}catch(e){}}
 refresh();refreshRideSummary();setInterval(()=>{if(!document.hidden)refresh()},100);setInterval(updateStaleState,500);setInterval(()=>{if(!document.hidden)refreshRideSummary()},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden){refresh();refreshRideSummary()}});
@@ -2049,7 +2286,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <header class="top"><a class="back" href="/" aria-label="Dashboard">‹</a><div class="title"><h1>Controller Settings</h1><p>Configuration, service controls & firmware</p></div></header>
 <div class="grid">
 <section class="card half"><h2>Wheelie Detection</h2><label>Angle processing mode</label><select id="angleMode"><option value="absolute">Absolute — fixed calibration zero</option><option value="adaptive">Adaptive — follows gradual terrain</option></select><div id="adaptiveSettings"><label>Adaptive zero time constant (seconds)</label><input id="adaptiveTau" type="number" min="0.5" max="60" step="0.5"><label>Freeze baseline above pitch rate (°/sec)</label><input id="freezeRate" type="number" min="1" max="100" step="0.5"><p class="note">The adaptive baseline follows hills slowly, but freezes during rapid pitch changes and wheelie detection.</p></div><label>Trigger angle (°)</label><input id="trigger" type="number" min="5" max="70" step="0.5"><label>Reset angle (°)</label><input id="reset" type="number" min="0" max="69" step="0.5"><label>Trigger hold (ms)</label><input id="hold" type="number" min="0" max="5000" step="10"><label>Minimum ON time (ms)</label><input id="minon" type="number" min="0" max="15000" step="50"></section>
-<section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><label>Ride telemetry logging</label><select id="rideLogging"><option value="disabled">Disabled — default</option><option value="enabled">Enabled — retain 3 rides</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Ride logging is opt-in and disabled by default. Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
+<section class="card half"><h2>Output & Startup</h2><label>Wheelie brightness</label><div class="range"><input id="brightness" type="range" min="1" max="100"><output id="brightnessOut">100%</output></div><label>Fade time</label><div class="range"><input id="fade" type="range" min="0" max="3000" step="50"><output id="fadeOut">200 ms</output></div><label>Default power-up mode</label><select id="bootMode"><option value="standby">Standby</option><option value="armed">Armed</option></select><label>Ride telemetry logging</label><select id="rideLogging"><option value="disabled">Disabled — default</option><option value="enabled">Enabled — retain 3 rides</option></select><label>Rider Model Lab</label><select id="riderModel"><option value="disabled">Disabled — default</option><option value="enabled">Enabled — advisory learning</option></select><div class="actions"><button class="primary wide" onclick="saveSettings()">Save Settings</button></div><p class="note">Ride logging and rider modeling are independent, opt-in features that default to disabled. Saving settings cancels any pending/active wheelie state and commands the output OFF while the new values are applied.</p></section>
 <section class="card half"><h2>Mounting & Orientation</h2><input type="hidden" id="rotationAxis" value="y"><div class="rows"><div class="row"><span>Setup</span><strong id="orientationState">---</strong></div><div class="row"><span>Pitch axis</span><strong id="pitchAxisLive">---</strong></div><div class="row"><span>Roll axis</span><strong id="rollAxisLive">---</strong></div><div class="row"><span>Vertical axis</span><strong id="verticalAxisLive">---</strong></div><div class="row"><span>Live lean</span><strong id="leanAngle">0.0°</strong></div></div><div class="actions"><button class="primary wide" onclick="runOrientationWizard()">Run Mounting Wizard</button></div><p class="note">This runs automatically on first setup and is saved in device memory. Park securely, hold the bike upright, then lean it smoothly side to side several times without lifting the wheels. Output remains OFF and the controller stays in STANDBY afterward.</p></section>
 <section class="card half"><h2>Dashboard Appearance</h2><label for="bikeColor">Motorcycle accent color</label><div style="display:grid;grid-template-columns:70px 1fr;gap:12px;align-items:center"><input id="bikeColor" type="color" value="#4ca6ff" style="height:54px;padding:5px;cursor:pointer"><div id="colorSwatch" style="height:54px;border-radius:11px;border:1px solid var(--line);background:var(--bikePreview);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)"></div></div><label for="pitchTapeSetting">Pitch tape</label><select id="pitchTapeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><label for="leanGaugeSetting">Rider HUD lean gauge</label><select id="leanGaugeSetting"><option value="on">Shown</option><option value="off">Hidden</option></select><div class="actions"><button class="wide" type="button" onclick="resetBikeColor()">Reset Default Color</button></div><p class="note">The lean gauge uses the roll axis saved by the mounting wizard. Appearance preferences are stored by this browser and apply to the dashboard on this device.</p></section>
 <section class="card half"><h2>Pitch Display Alerts</h2><label for="wheelieEffectMode">Wheelie background</label><select id="wheelieEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><label for="wheelieEffectColor">Wheelie color</label><input id="wheelieEffectColor" type="color" value="#22c55e" style="height:48px;padding:5px;cursor:pointer"><label for="warningEffectMode">Angle warning background</label><select id="warningEffectMode"><option value="off">Off</option><option value="solid">Solid color</option><option value="flash">Flashing color</option></select><div style="display:grid;grid-template-columns:1fr 82px;gap:10px"><div><label for="warningEffectAngle">Warning angle (°)</label><input id="warningEffectAngle" type="number" min="0" max="70" step="0.5" value="15"></div><div><label for="warningEffectColor">Color</label><input id="warningEffectColor" type="color" value="#ef4444" style="height:48px;padding:5px;cursor:pointer"></div></div><p class="note">Both effects are disabled by default. The high-angle warning takes priority whenever its threshold is reached.</p></section>
@@ -2058,6 +2295,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
 <section class="card half"><h2>Manual Output Test</h2><div class="actions"><button onclick="testOutput(25)">25%</button><button onclick="testOutput(50)">50%</button><button onclick="testOutput(75)">75%</button><button onclick="testOutput(100)">100%</button><button class="bad wide" onclick="testOutput(0)">OFF</button></div><p class="note">Only available in STANDBY. Non-zero test commands automatically expire after 10 seconds.</p></section>
 <section class="card half"><h2>Network & System</h2><div class="rows"><div class="row"><span>Access point</span><strong id="apState">ON</strong></div><div class="row"><span>SSID</span><strong id="apSsid">---</strong></div><div class="row"><span>Friendly address</span><strong>wheelie.local</strong></div><div class="row"><span>Guaranteed fallback</span><strong>192.168.4.1</strong></div><div class="row"><span>Discovery</span><strong id="discovery">---</strong></div><div class="row"><span>Clients</span><strong id="clients">0</strong></div><div class="row"><span>Uptime</span><strong id="uptime">0 sec</strong></div><div class="row"><span>Firmware</span><strong id="firmware">---</strong></div><div class="row"><span>Build commit</span><strong id="buildCommit">---</strong></div><div class="row"><span>Build date</span><strong id="buildDate">---</strong></div><div class="row"><span>Release channel</span><strong id="releaseChannel">---</strong></div><div class="row"><span>Hardware target</span><strong id="hardwareTarget">---</strong></div></div><label>Wi-Fi password</label><input id="wifiPassword" type="password" minlength="8" maxlength="63" autocomplete="new-password" placeholder="Enter a new 8-63 character password"><div class="actions"><button class="primary wide" onclick="saveWifiPassword()">Update Wi-Fi Password</button><button class="wide" onclick="generateWifiPassword()">Generate Unique Device Password</button></div><p class="note">Changing or generating the password restarts the access point and disconnects this browser. A generated password is shown once so it can be copied before reconnecting. Hold the physical button for <b>30 seconds</b> to restore <b>wheeliectrl</b>.</p><p class="note"><b>Triple-tap</b> toggles the access point. mDNS and the captive DNS/portal fallback remain enabled; use <b>192.168.4.1</b> if <b>wheelie.local</b> is unavailable.</p></section>
 <section class="card"><div class="reportHead"><div><h2>Ride Reports</h2><p class="note">When enabled, telemetry is sampled at 5 Hz for up to 90 minutes per ride. Only the newest 3 sessions are kept; the oldest is overwritten automatically.</p></div><div class="proof">DEVICE-RECORDED<small>SENSOR DATA · SHA-256</small></div></div><div id="rideReports" class="rideList"><div class="rideItem note">Loading ride sessions…</div></div><p class="note">The checksum can detect changes to the sample stream. It is not a third-party certification or a cryptographic device signature.</p></section>
+<section class="card"><div class="reportHead"><div><h2>Rider Model Lab</h2><p class="note">The 50 Hz shadow model records compact event features and learns the bike's stable vibration floor. It never controls the light.</p></div><div class="proof">SHADOW MODE<small>ADVISORY ONLY</small></div></div><div class="rows"><div class="row"><span>Stable samples</span><strong id="modelStable">0</strong></div><div class="row"><span>Suggested freeze rate</span><strong id="modelFreeze">---</strong></div><div class="row"><span>Model confidence</span><strong id="modelConfidence">0%</strong></div><div class="row"><span>Rider labels</span><strong id="modelLabels">0</strong></div></div><div id="modelEvents" class="rideList"><div class="rideItem note">No captured events yet.</div></div><div class="actions"><button onclick="downloadModelEvents()">Download Feature CSV</button><button class="warn" onclick="markMissedEvent()">Mark Missed Event</button><button class="bad wide" onclick="resetRiderModel()">Reset Rider Model</button></div><p class="note">Mark captured events as Intentional or Nuisance so future offline models have independent rider labels. “Missed Event” snapshots the preceding two seconds. Only 12 compact event summaries are retained.</p></section>
 <section class="card half"><h2>Configuration Backup</h2><div class="actions"><button onclick="exportSettings()">Export JSON</button><button onclick="$('settingsFile').click()">Import JSON</button></div><input class="file hidden" id="settingsFile" type="file" accept=".json,application/json"><p class="note">Export includes controller settings and browser-local dashboard appearance. Imported values are validated by the controller when applied.</p></section>
 <section class="card half"><h2>Firmware Update & Recovery</h2><label for="otaChannel">Accepted OTA channel</label><select id="otaChannel"><option value="stable">Stable — main branch releases</option><option value="testing">Testing — testing branch builds</option></select><input class="file" id="firmwareFile" type="file" accept=".wctrl,application/octet-stream"><div class="actions"><button class="primary wide" onclick="uploadFirmware()">Upload Signed OTA Package</button><button class="bad wide" onclick="rollbackFirmware()">Return to Previous Firmware</button></div><p class="note">Only signed <b>.wctrl</b> packages for this XIAO ESP32-S3 and the selected channel are accepted. The firmware SHA-256 and ECDSA signature are verified before the OTA partition is activated. Save Settings after changing channels.</p><p class="note">The output is forced OFF during updates and rollback. The previous image remains in the alternate OTA partition until another update replaces it.</p></section>
 </div><div class="message" id="message">Ready</div></div>
@@ -2070,8 +2308,8 @@ $('bikeColor').addEventListener('input',e=>applyBikeColor(e.target.value));apply
 let savedPitchTape='on';try{savedPitchTape=localStorage.getItem('wheeliePitchTape')||'on'}catch(e){}$('pitchTapeSetting').value=savedPitchTape;$('pitchTapeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheeliePitchTape',e.target.value)}catch(err){}msg('Pitch tape preference saved')});
 let savedLeanGauge='on';try{savedLeanGauge=localStorage.getItem('wheelieLeanGauge')||'on'}catch(e){}$('leanGaugeSetting').value=savedLeanGauge;$('leanGaugeSetting').addEventListener('change',e=>{try{localStorage.setItem('wheelieLeanGauge',e.target.value)}catch(err){}msg('Lean gauge preference saved')});
 const localValue=(key,fallback)=>{try{return localStorage.getItem(key)||fallback}catch(e){return fallback}};const effectFields={wheelieEffectMode:'off',wheelieEffectColor:'#22c55e',warningEffectMode:'off',warningEffectAngle:'15',warningEffectColor:'#ef4444'};Object.entries(effectFields).forEach(([id,fallback])=>{$(id).value=localValue(id,fallback);$(id).addEventListener('change',e=>{let value=e.target.value;if(id==='warningEffectAngle'){value=String(Math.max(0,Math.min(70,parseFloat(value)||15)));e.target.value=value}try{localStorage.setItem(id,value)}catch(err){}msg('Pitch alert preference saved')})});
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('orientationState').textContent=d.orientationConfigured?'SAVED':'REQUIRED';$('orientationState').className=d.orientationConfigured?'statusGood':'statusWarn';$('pitchAxisLive').textContent=d.rotationAxis.toUpperCase();$('rollAxisLive').textContent=d.rollAxis.toUpperCase();$('verticalAxisLive').textContent=d.verticalAxis.toUpperCase();$('leanAngle').textContent=d.roll.toFixed(1)+'°';$('rotationAxis').value=d.rotationAxis;$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;$('buildCommit').textContent=d.buildCommit;$('buildDate').textContent=d.buildDate;$('releaseChannel').textContent=d.releaseChannel.toUpperCase();$('hardwareTarget').textContent=d.board+' / '+d.chip;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';$('rideLogging').value=d.rideLoggingEnabled?'enabled':'disabled';$('otaChannel').value=d.otaChannel;syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
-async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,rideLogging:$('rideLogging').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value,otaChannel:$('otaChannel').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();refreshRideReports();}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();token=d.token;$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'statusGood':'statusBad';$('angleModeLive').textContent=d.angleMode.toUpperCase();$('gload').textContent='+'+d.gLoad.toFixed(2)+' g';$('orientationState').textContent=d.orientationConfigured?'SAVED':'REQUIRED';$('orientationState').className=d.orientationConfigured?'statusGood':'statusWarn';$('pitchAxisLive').textContent=d.rotationAxis.toUpperCase();$('rollAxisLive').textContent=d.rollAxis.toUpperCase();$('verticalAxisLive').textContent=d.verticalAxis.toUpperCase();$('leanAngle').textContent=d.roll.toFixed(1)+'°';$('rotationAxis').value=d.rotationAxis;$('apState').textContent=d.apEnabled?'ON':'OFF';$('discovery').textContent=(d.mdns?'mDNS ':'')+(d.dns?'Captive DNS':'')||'IP only';$('clients').textContent=d.clients;$('uptime').textContent=d.uptime+' sec';$('firmware').textContent=d.firmware;$('buildCommit').textContent=d.buildCommit;$('buildDate').textContent=d.buildDate;$('releaseChannel').textContent=d.releaseChannel.toUpperCase();$('hardwareTarget').textContent=d.board+' / '+d.chip;if(!settingsLoaded){$('angleMode').value=d.angleMode;$('adaptiveTau').value=d.adaptiveTau;$('freezeRate').value=d.freezeRate;$('trigger').value=d.trigger;$('reset').value=d.reset;$('hold').value=d.hold;$('minon').value=d.minon;$('brightness').value=d.brightness;$('brightnessOut').textContent=d.brightness+'%';$('fade').value=d.fade;$('fadeOut').textContent=d.fade+' ms';$('bootMode').value=d.bootArmed?'armed':'standby';$('rideLogging').value=d.rideLoggingEnabled?'enabled':'disabled';$('riderModel').value=d.riderModelEnabled?'enabled':'disabled';$('otaChannel').value=d.otaChannel;syncAdaptive();settingsLoaded=true;}}catch(e){msg('Connection lost');}}
+async function saveSettings(){const body=new URLSearchParams({angleMode:$('angleMode').value,rotationAxis:$('rotationAxis').value,adaptiveTau:$('adaptiveTau').value,freezeRate:$('freezeRate').value,trigger:$('trigger').value,reset:$('reset').value,hold:$('hold').value,minon:$('minon').value,brightness:$('brightness').value,fade:$('fade').value,bootMode:$('bootMode').value,rideLogging:$('rideLogging').value,riderModel:$('riderModel').value,wheeliePattern:$('wheeliePattern').value,warningPattern:$('warningPattern').value,warningBrightness:$('warningBrightness').value,warningAngle:$('warningAngleFirmware').value,warningReset:$('warningResetFirmware').value,warningRate:$('warningRateFirmware').value,otaChannel:$('otaChannel').value});const r=await fetch('/api/settings?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());settingsLoaded=false;axisLoaded=false;advancedLoaded=false;refresh();refreshSsid();refreshRideReports();refreshRiderModel();}
 async function setMode(mode){const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+mode,{method:'POST'});msg(await r.text());refresh();}
 async function calibrate(){msg('Calibrating — keep bike stationary...');const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());refresh();}
 async function runOrientationWizard(){if(!confirm('Park securely and run the mounting wizard now? The controller will enter STANDBY. Follow the OLED prompts: upright first, then lean side to side.'))return;msg('Wizard running — follow the OLED prompts on the bike...');try{const r=await fetch('/api/orientation?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());settingsLoaded=false;axisLoaded=false;refresh();refreshSsid()}catch(e){msg('Wizard connection failed — check the controller display')}}
@@ -2079,14 +2317,19 @@ async function refreshSsid(){try{const r=await fetch('/api/status',{cache:'no-st
 async function testOutput(level){const r=await fetch('/api/output?token='+encodeURIComponent(token)+'&level='+level,{method:'POST'});msg(await r.text());refresh();}
 async function saveWifiPassword(){const p=$('wifiPassword').value;if(p.length<8||p.length>63){msg('Wi-Fi password must be 8-63 characters');return;}if(!confirm('Change Wi-Fi password? You will need to reconnect.'))return;const body=new URLSearchParams({password:p});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});msg(await r.text());$('wifiPassword').value='';}catch(e){msg('Password saved; reconnect to the controller AP');}}
 async function generateWifiPassword(){if(!confirm('Generate a unique 16-character password for this controller? Copy it before reconnecting.'))return;const body=new URLSearchParams({generate:'1'});try{const r=await fetch('/api/wifi?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body}),text=await r.text();alert(text);msg('Password generated; reconnect to the controller AP')}catch(e){msg('Password generated; reconnect and use the password shown')}}
-function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','rideLogging','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware','otaChannel'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieLeanGauge','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
+function exportSettings(){const ids=['angleMode','rotationAxis','adaptiveTau','freezeRate','trigger','reset','hold','minon','brightness','fade','bootMode','rideLogging','riderModel','wheeliePattern','warningPattern','warningBrightness','warningAngleFirmware','warningResetFirmware','warningRateFirmware','otaChannel'];const controller={};ids.forEach(id=>controller[id]=$(id).value);const localKeys=['wheelieTheme','wheelieBikeColor','wheeliePitchTape','wheelieLeanGauge','wheelieEffectMode','wheelieEffectColor','warningEffectMode','warningEffectAngle','warningEffectColor'];const appearance={};localKeys.forEach(key=>{try{appearance[key]=localStorage.getItem(key)}catch(e){}});const blob=new Blob([JSON.stringify({format:'wheelie-controller-settings',version:1,controller,appearance},null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-controller-settings.json';a.click();URL.revokeObjectURL(a.href);msg('Settings exported')}
 function rideDuration(ms){const total=Math.round(ms/1000),minutes=Math.floor(total/60),seconds=total%60;return minutes+'m '+String(seconds).padStart(2,'0')+'s'}
 async function downloadRide(id,format){const path=format==='csv'?'/api/ride/csv':'/api/ride/report';try{const r=await fetch(path+'?id='+encodeURIComponent(id));if(!r.ok)throw new Error(await r.text());const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-ride-'+id+(format==='csv'?'.csv':'-report.html');a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);msg('Ride '+id+' '+format.toUpperCase()+' downloaded')}catch(e){msg('Download failed: '+e.message)}}
 async function refreshRideReports(){try{const r=await fetch('/api/rides',{cache:'no-store'}),d=await r.json(),list=$('rideReports');if(!d.available){list.innerHTML='<div class="rideItem note">Ride storage is unavailable.</div>';return}if(!d.sessions.length){list.innerHTML='<div class="rideItem note">'+(d.enabled?'No completed rides yet. Arm the controller to begin a session.':'Logging is disabled. Enable it under Output &amp; Startup, then save settings.')+'</div>';return}list.innerHTML=d.sessions.map(s=>'<div class="rideItem"><div class="rideTop"><strong>Ride #'+s.id+(s.active?' · RECORDING':'')+'</strong><span>'+rideDuration(s.durationMs)+'</span></div><div class="rideMeta">'+s.samples.toLocaleString()+' samples · '+s.wheelies+' wheelies · '+s.peakPitch.toFixed(1)+'° peak pitch · '+s.peakRoll.toFixed(1)+'° peak lean</div>'+(s.active?'<div class="rideMeta">Return to STANDBY to finalize and download this ride.</div>':'<div class="rideActions"><button onclick="downloadRide('+s.id+',\'report\')">Ride Report</button><button onclick="downloadRide('+s.id+',\'csv\')">CSV Data</button></div>')+'</div>').join('')}catch(e){$('rideReports').innerHTML='<div class="rideItem note">Unable to load ride reports.</div>'}}
+async function refreshRiderModel(){try{const r=await fetch('/api/model',{cache:'no-store'}),d=await r.json();$('modelStable').textContent=d.enabled?d.stableSamples.toLocaleString():'DISABLED';$('modelFreeze').textContent=d.recommendedFreezeRate.toFixed(1)+'°/s';$('modelConfidence').textContent=Math.round(d.confidence*100)+'%';$('modelLabels').textContent=(d.correctLabels+d.falseLabels+d.missedLabels)+' total';const list=$('modelEvents'),events=[...d.events].reverse();if(!events.length){list.innerHTML='<div class="rideItem note">'+(d.enabled?'No captured events yet.':'Enable Rider Model Lab above and save settings to begin advisory learning.')+'</div>';return}list.innerHTML=events.map(e=>'<div class="rideItem"><div class="rideTop"><strong>Event #'+e.id+' · '+e.outcome.toUpperCase()+'</strong><span>'+Math.round(e.shadowScore*100)+'% shadow score</span></div><div class="rideMeta">'+e.pitchRise.toFixed(1)+'° rise · '+e.peakPitchRate.toFixed(1)+'°/s peak · +'+e.peakG.toFixed(2)+' g · '+e.samples+' samples</div>'+(e.label==='unlabeled'?'<div class="rideActions"><button class="good" onclick="labelModelEvent('+e.id+',\'correct\')">Intentional</button><button class="bad" onclick="labelModelEvent('+e.id+',\'false\')">Nuisance</button></div>':'<div class="rideMeta">Rider label: '+e.label.toUpperCase()+'</div>')+'</div>').join('')}catch(e){$('modelEvents').innerHTML='<div class="rideItem note">Unable to load rider model.</div>'}}
+async function labelModelEvent(id,label){if(!confirm('Label event #'+id+' as '+label+'? Labels cannot be changed on-device.'))return;const r=await fetch('/api/model/feedback?token='+encodeURIComponent(token)+'&id='+id+'&label='+label,{method:'POST'});msg(await r.text());await refresh();refreshRiderModel()}
+async function markMissedEvent(){if(!confirm('Save the preceding two seconds as a missed event?'))return;const r=await fetch('/api/model/feedback?token='+encodeURIComponent(token)+'&label=missed',{method:'POST'});msg(await r.text());await refresh();refreshRiderModel()}
+async function downloadModelEvents(){try{const r=await fetch('/api/model/events.csv');if(!r.ok)throw new Error(await r.text());const blob=await r.blob(),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='wheelie-model-events.csv';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);msg('Model feature CSV downloaded')}catch(e){msg('Model download failed: '+e.message)}}
+async function resetRiderModel(){if(!confirm('Reset the learned vibration profile, labels, and 12 recent model events? Ride reports are not affected.'))return;const r=await fetch('/api/model/reset?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text());await refresh();refreshRiderModel()}
 $('settingsFile').addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());if(data.format!=='wheelie-controller-settings'||!data.controller)throw new Error('Unsupported settings file');Object.entries(data.controller).forEach(([id,value])=>{if($(id))$(id).value=value});if(data.appearance)Object.entries(data.appearance).forEach(([key,value])=>{if(value!==null)localStorage.setItem(key,value)});$('brightnessOut').textContent=$('brightness').value+'%';$('fadeOut').textContent=$('fade').value+' ms';$('warningBrightnessOut').textContent=$('warningBrightness').value+'%';if(confirm('Settings loaded. Apply them to the controller now?'))await saveSettings();else msg('Settings loaded for review; use Save Settings to apply')}catch(err){msg('Import failed: '+err.message)}e.target.value=''});
 async function rollbackFirmware(){if(!confirm('Reboot into the previous firmware image?'))return;try{const r=await fetch('/api/rollback?token='+encodeURIComponent(token),{method:'POST'});msg(await r.text())}catch(e){msg('Controller is rebooting or rollback failed')}}
 async function uploadFirmware(){const f=$('firmwareFile').files[0];if(!f){msg('Choose a signed .wctrl package first');return;}if(!f.name.toLowerCase().endsWith('.wctrl')){msg('Unsigned .bin files are not accepted');return;}if(!confirm('Verify and install '+f.name+'?'))return;const form=new FormData();form.append('update',f,f.name);msg('Verifying signed firmware — do not remove power...');try{const r=await fetch('/api/update?token='+encodeURIComponent(token),{method:'POST',body:form});msg(await r.text());}catch(e){msg('Controller rebooting — reconnect shortly');}}
-refresh();refreshSsid();refreshRideReports();setInterval(refresh,500);setInterval(refreshSsid,5000);setInterval(refreshRideReports,5000);
+refresh();refreshSsid();refreshRideReports();refreshRiderModel();setInterval(refresh,500);setInterval(refreshSsid,5000);setInterval(refreshRideReports,5000);setInterval(refreshRiderModel,3000);
 </script></body></html>
 )rawliteral";
 
@@ -2122,7 +2365,10 @@ void handleStatus() {
     json += ",\"rollRate\":" + String(currentRollRate, 2);
     json += ",\"baseline\":" + String(adaptiveBaseline, 2);
     json += ",\"gyroRate\":" + String(currentGyroRate, 2);
+    json += ",\"filteredGyroRate\":" + String(currentFilteredGyroRate, 2);
     json += ",\"gLoad\":" + String(currentGLoad, 3);
+    json += ",\"accelMagnitude\":" + String(currentAccelerationMagnitude, 3);
+    json += ",\"accelTrust\":" + String(currentAccelerationTrust, 3);
     json += ",\"peakAngle\":" + String(highestAngle, 2);
     json += ",\"peakG\":" + String(highestGLoad, 3);
     json += ",\"warningActive\":" + String(highAngleWarningActive ? "true" : "false");
@@ -2141,6 +2387,7 @@ void handleStatus() {
     json += ",\"accelY\":" + String(currentAccelY, 3);
     json += ",\"accelZ\":" + String(currentAccelZ, 3);
     json += ",\"baselineFrozen\":" + String(adaptiveBaselineFrozen ? "true" : "false");
+    json += ",\"baselineState\":\"" + String(getAdaptiveFreezeReasonName()) + "\"";
     json += ",\"mode\":\"" + String(getModeName()) + "\"";
     json += ",\"state\":\"" + String(getStateName()) + "\"";
     json += ",\"output\":" + String(outputPercent);
@@ -2155,6 +2402,7 @@ void handleStatus() {
     json += ",\"orientationConfigured\":" + String(orientationConfigured ? "true" : "false");
     json += ",\"adaptiveTau\":" + String(settings.adaptiveTimeConstantSec, 1);
     json += ",\"freezeRate\":" + String(settings.adaptiveFreezeRateDegSec, 1);
+    json += ",\"effectiveFreezeRate\":" + String(effectiveAdaptiveFreezeRate, 1);
     json += ",\"trigger\":" + String(settings.triggerAngle, 1);
     json += ",\"reset\":" + String(settings.resetAngle, 1);
     json += ",\"hold\":" + String(settings.triggerHoldMs);
@@ -2189,10 +2437,185 @@ void handleStatus() {
     json += ",\"calAccelRms\":" + String(calibrationAccelNoiseRms, 4);
     json += ",\"calGyroRms\":" + String(calibrationGyroNoiseRms, 2);
     json += ",\"calHighVibration\":" + String(calibrationHighVibration ? "true" : "false");
+    json += ",\"modelStableSamples\":" + String(riderProfile.stableSamples);
+    json += ",\"riderModelEnabled\":" + String(riderModelEnabled ? "true" : "false");
+    json += ",\"modelGyroRms\":" + String(riderProfileGyroRms(riderProfile), 3);
+    json += ",\"modelRecommendedFreezeRate\":" + String(recommendedRiderFreezeRate(), 2);
+    json += ",\"modelAccelRms\":" + String(riderProfileAccelResidualRms(riderProfile), 4);
+    json += ",\"modelCorrectLabels\":" + String(riderProfile.labeledCorrect);
+    json += ",\"modelFalseLabels\":" + String(riderProfile.labeledFalse);
+    json += ",\"modelMissedLabels\":" + String(riderProfile.labeledMissed);
+    json += ",\"modelConfidence\":" + String(riderModelConfidence(riderProfile), 3);
+    json += ",\"modelEventCount\":" + String(modelEventHistory.count);
+    if (modelEventHistory.count > 0) {
+        const uint8_t newest = (uint8_t)(
+            (modelEventHistory.head + EVENT_HISTORY_CAPACITY - 1) %
+            EVENT_HISTORY_CAPACITY);
+        json += ",\"modelLastEventId\":" + String(modelEventHistory.events[newest].id);
+        json += ",\"modelLastScore\":" + String(modelEventHistory.events[newest].shadowScore, 3);
+    } else {
+        json += ",\"modelLastEventId\":0,\"modelLastScore\":0";
+    }
     json += ",\"token\":\"" + writeToken + "\"";
     json += "}";
 
     server.send(200, "application/json", json);
+}
+
+void handleRiderModel() {
+    String json;
+    json.reserve(4096);
+    json = "{\"format\":\"wheelie-rider-model\",\"version\":1";
+    json += ",\"enabled\":" + String(riderModelEnabled ? "true" : "false");
+    json += ",\"firmware\":\"" + String(FIRMWARE_VERSION) + "\"";
+    json += ",\"sampleRateHz\":" + String(MODEL_SAMPLE_RATE_HZ);
+    json += ",\"stableSamples\":" + String(riderProfile.stableSamples);
+    json += ",\"gyroRms\":" + String(riderProfileGyroRms(riderProfile), 4);
+    json += ",\"accelResidualRms\":" + String(riderProfileAccelResidualRms(riderProfile), 4);
+    json += ",\"effectiveFreezeRate\":" + String(effectiveAdaptiveFreezeRate, 2);
+    json += ",\"recommendedFreezeRate\":" + String(recommendedRiderFreezeRate(), 2);
+    json += ",\"correctLabels\":" + String(riderProfile.labeledCorrect);
+    json += ",\"falseLabels\":" + String(riderProfile.labeledFalse);
+    json += ",\"missedLabels\":" + String(riderProfile.labeledMissed);
+    json += ",\"confidence\":" + String(riderModelConfidence(riderProfile), 3);
+    json += ",\"events\":[";
+    const uint8_t oldest = (uint8_t)(
+        (modelEventHistory.head + EVENT_HISTORY_CAPACITY - modelEventHistory.count) %
+        EVENT_HISTORY_CAPACITY);
+    for (uint8_t logical = 0; logical < modelEventHistory.count; ++logical) {
+        if (logical > 0) json += ',';
+        const ModelEventFeatures& event = modelEventHistory.events[
+            (oldest + logical) % EVENT_HISTORY_CAPACITY];
+        json += "{\"id\":" + String(event.id);
+        json += ",\"rideSessionId\":" + String(event.rideSessionId);
+        json += ",\"outcome\":\"" + String(getModelOutcomeName(event.outcome)) + "\"";
+        json += ",\"label\":\"" + String(getModelLabelName(event.label)) + "\"";
+        json += ",\"durationMs\":" + String(event.durationMs);
+        json += ",\"samples\":" + String(event.sampleCount);
+        json += ",\"pitchRise\":" + String(event.pitchRise, 3);
+        json += ",\"peakPitch\":" + String(event.peakPitch, 3);
+        json += ",\"peakPitchRate\":" + String(event.peakPitchRate, 3);
+        json += ",\"rmsPitchRate\":" + String(event.rmsPitchRate, 3);
+        json += ",\"integratedPositiveRate\":" + String(event.integratedPositiveRate, 3);
+        json += ",\"peakG\":" + String(event.peakG, 3);
+        json += ",\"rmsG\":" + String(event.rmsG, 3);
+        json += ",\"peakAbsRoll\":" + String(event.peakAbsRoll, 3);
+        json += ",\"frozenFraction\":" + String(event.frozenFraction, 3);
+        json += ",\"shadowScore\":" + String(event.shadowScore, 3) + "}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+}
+
+void handleRiderModelCsv() {
+    String csv;
+    csv.reserve(4096);
+    csv = "firmware,commit,ride_session_id,event_id,outcome,label,duration_ms,samples,above_trigger_samples,start_pitch,end_pitch,peak_pitch,pitch_rise,peak_pitch_rate,rms_pitch_rate,integrated_positive_rate,peak_g,rms_g,peak_abs_roll,frozen_fraction,shadow_score\n";
+    const uint8_t oldest = (uint8_t)(
+        (modelEventHistory.head + EVENT_HISTORY_CAPACITY - modelEventHistory.count) %
+        EVENT_HISTORY_CAPACITY);
+    for (uint8_t logical = 0; logical < modelEventHistory.count; ++logical) {
+        const ModelEventFeatures& event = modelEventHistory.events[
+            (oldest + logical) % EVENT_HISTORY_CAPACITY];
+        csv += String(FIRMWARE_VERSION) + ',' + String(BUILD_COMMIT) + ',' +
+            String(event.rideSessionId) + ',' + String(event.id) + ',';
+        csv += String(getModelOutcomeName(event.outcome)) + ',' + String(getModelLabelName(event.label)) + ',';
+        csv += String(event.durationMs) + ',' + String(event.sampleCount) + ',' +
+            String(event.aboveTriggerSamples) + ',';
+        csv += String(event.startPitch, 3) + ',' + String(event.endPitch, 3) + ',' +
+            String(event.peakPitch, 3) + ',' + String(event.pitchRise, 3) + ',';
+        csv += String(event.peakPitchRate, 3) + ',' + String(event.rmsPitchRate, 3) + ',' +
+            String(event.integratedPositiveRate, 3) + ',';
+        csv += String(event.peakG, 3) + ',' + String(event.rmsG, 3) + ',' +
+            String(event.peakAbsRoll, 3) + ',' + String(event.frozenFraction, 3) + ',' +
+            String(event.shadowScore, 3) + '\n';
+    }
+    server.sendHeader(
+        "Content-Disposition", "attachment; filename=wheelie-model-events.csv");
+    server.send(200, "text/csv; charset=utf-8", csv);
+}
+
+void handleRiderModelFeedback() {
+    if (!requireWriteToken()) return;
+    if (!server.hasArg("label")) {
+        server.send(400, "text/plain", "Missing feedback label");
+        return;
+    }
+    const String label = server.arg("label");
+    if (label == "missed") {
+        if (!riderModelEnabled) {
+            server.send(409, "text/plain", "Enable Rider Model Lab in Settings first");
+            return;
+        }
+        if (modelEventAccumulator.active) {
+            server.send(409, "text/plain", "Wait for the active event capture to finish");
+            return;
+        }
+        beginCapturedModelEvent(millis());
+        if (modelPreEventCount > 0) {
+            const uint16_t oldest = (uint16_t)(
+                (modelPreEventHead + MODEL_PRE_EVENT_SAMPLES - modelPreEventCount) %
+                MODEL_PRE_EVENT_SAMPLES);
+            modelEventAccumulator.startedMs = modelPreEventRing[oldest].timeMs;
+        }
+        modelPendingOutcome = ModelEventOutcome::MISSED;
+        ModelEventFeatures event = finishModelEvent(
+            modelEventAccumulator, millis(), ModelEventOutcome::MISSED);
+        event.rideSessionId = rideSessionActive ? activeRideHeader.sessionId : 0;
+        event.label = ModelEventLabel::MISSED;
+        appendModelEvent(modelEventHistory, event);
+        updateRiderProfileFromLabel(riderProfile, event, event.label);
+        riderModelDirty = true;
+        saveRiderModel();
+        rotateWriteToken();
+        server.send(200, "text/plain", "Missed event saved for model shaping");
+        return;
+    }
+
+    if (!server.hasArg("id") || (label != "correct" && label != "false")) {
+        server.send(400, "text/plain", "Use an event id with correct or false");
+        return;
+    }
+    ModelEventFeatures* event = findModelEvent(
+        modelEventHistory, (uint32_t)server.arg("id").toInt());
+    if (event == nullptr) {
+        server.send(404, "text/plain", "Model event not found");
+        return;
+    }
+    if (event->label != ModelEventLabel::UNLABELED) {
+        server.send(409, "text/plain", "This event already has rider feedback");
+        return;
+    }
+    event->label = label == "correct"
+        ? ModelEventLabel::CORRECT : ModelEventLabel::FALSE_TRIGGER;
+    updateRiderProfileFromLabel(riderProfile, *event, event->label);
+    riderModelDirty = true;
+    saveRiderModel();
+    rotateWriteToken();
+    server.send(200, "text/plain", "Rider feedback saved");
+}
+
+void handleRiderModelReset() {
+    if (!requireWriteToken()) return;
+    memset(&riderProfile, 0, sizeof(riderProfile));
+    riderProfile.magic = RIDER_PROFILE_MAGIC;
+    riderProfile.version = RIDER_PROFILE_VERSION;
+    riderProfile.size = sizeof(RiderProfile);
+    memset(&modelEventHistory, 0, sizeof(modelEventHistory));
+    modelEventHistory.magic = EVENT_HISTORY_MAGIC;
+    modelEventHistory.version = EVENT_HISTORY_VERSION;
+    modelEventHistory.size = sizeof(ModelEventHistory);
+    modelEventHistory.nextId = 1;
+    memset(&modelEventAccumulator, 0, sizeof(modelEventAccumulator));
+    modelPreEventCount = 0;
+    modelPreEventHead = 0;
+    modelFinishPending = false;
+    effectiveAdaptiveFreezeRate = calculateNoiseAwareFreezeRate(
+        settings.adaptiveFreezeRateDegSec, calibrationGyroNoiseRms);
+    riderModelDirty = true;
+    saveRiderModel();
+    rotateWriteToken();
+    server.send(200, "text/plain", "Rider profile and event labels reset");
 }
 
 String rideDigestHex(const uint8_t digest[32]) {
@@ -2397,7 +2820,7 @@ void handleSettings() {
         "angleMode", "rotationAxis", "adaptiveTau", "freezeRate", "trigger", "reset",
         "hold", "minon", "brightness", "fade", "bootMode", "wheeliePattern",
         "warningPattern", "warningBrightness", "warningAngle", "warningReset", "warningRate",
-        "otaChannel", "rideLogging"
+        "otaChannel", "rideLogging", "riderModel"
     };
 
     for (const char* key : required) {
@@ -2426,6 +2849,7 @@ void handleSettings() {
     float newWarningRate = server.arg("warningRate").toFloat();
     String newOtaChannel = server.arg("otaChannel");
     String newRideLogging = server.arg("rideLogging");
+    String newRiderModel = server.arg("riderModel");
 
     if (angleMode != "absolute" && angleMode != "adaptive") {
         server.send(400, "text/plain", "Invalid angle mode");
@@ -2493,6 +2917,10 @@ void handleSettings() {
         server.send(400, "text/plain", "Ride logging must be enabled or disabled");
         return;
     }
+    if (newRiderModel != "enabled" && newRiderModel != "disabled") {
+        server.send(400, "text/plain", "Rider model must be enabled or disabled");
+        return;
+    }
 
     if (newWheeliePattern < 0 || newWheeliePattern > 4 ||
         newWarningPattern < 0 || newWarningPattern > 4) {
@@ -2523,9 +2951,13 @@ void handleSettings() {
     settings.warningAngle = newWarningAngle;
     settings.warningResetAngle = newWarningReset;
     settings.warningPitchRateDegSec = newWarningRate;
+    effectiveAdaptiveFreezeRate = calculateNoiseAwareFreezeRate(
+        settings.adaptiveFreezeRateDegSec, calibrationGyroNoiseRms);
     otaChannel = newOtaChannel;
     const bool wasRideLoggingEnabled = rideLoggingEnabled;
+    const bool wasRiderModelEnabled = riderModelEnabled;
     rideLoggingEnabled = newRideLogging == "enabled";
+    riderModelEnabled = newRiderModel == "enabled";
 
     controllerState = ControllerState::NORMAL;
     forceOutputOff();
@@ -2536,6 +2968,15 @@ void handleSettings() {
     } else if (!wasRideLoggingEnabled && rideLoggingEnabled &&
                operatingMode == OperatingMode::ARMED) {
         startRideSession();
+    }
+    if (wasRiderModelEnabled && !riderModelEnabled) {
+        memset(&modelEventAccumulator, 0, sizeof(modelEventAccumulator));
+        modelFinishPending = false;
+        saveRiderModel();
+    } else if (!wasRiderModelEnabled && riderModelEnabled) {
+        modelPreEventCount = 0;
+        modelPreEventHead = 0;
+        modelPreviousControllerState = controllerState;
     }
 
     oled.clearDisplay();
@@ -3046,6 +3487,10 @@ void registerWebRoutes() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/settings", HTTP_GET, handleSettingsPage);
     server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/model", HTTP_GET, handleRiderModel);
+    server.on("/api/model/events.csv", HTTP_GET, handleRiderModelCsv);
+    server.on("/api/model/feedback", HTTP_POST, handleRiderModelFeedback);
+    server.on("/api/model/reset", HTTP_POST, handleRiderModelReset);
     server.on("/api/rides", HTTP_GET, handleRideList);
     server.on("/api/ride/report", HTTP_GET, handleRideReport);
     server.on("/api/ride/csv", HTTP_GET, handleRideCsv);
@@ -3235,6 +3680,11 @@ bool updateIMUAndPitch(float& dt) {
     currentAccelX = data.ax * accelScaleCorrection;
     currentAccelY = data.ay * accelScaleCorrection;
     currentAccelZ = data.az * accelScaleCorrection;
+    currentAccelerationMagnitude = sqrtf(
+        currentAccelX * currentAccelX +
+        currentAccelY * currentAccelY +
+        currentAccelZ * currentAccelZ);
+    currentAccelerationTrust = calculateAccelerationTrust(currentAccelerationMagnitude);
 
     // Slowly estimate the gravity vector in sensor coordinates. This tracks
     // ordinary changes in road/bike attitude, while a launch or impact moves
@@ -3265,14 +3715,17 @@ bool updateIMUAndPitch(float& dt) {
     float rollRate = getGyroRateForAxis(data, rollAxis) - rollGyroBias;
 
     currentGyroRate = PITCH_SIGN * gyroRate;
+    currentFilteredGyroRate = updateLowPass(
+        currentFilteredGyroRate, currentGyroRate, dt,
+        GYRO_RATE_FILTER_TIME_CONSTANT_SEC);
     currentRollRate = rollRate;
 
-    pitch =
-        FILTER_ALPHA * (pitch + gyroRate * dt) +
-        (1.0f - FILTER_ALPHA) * accelPitch;
-    roll =
-        FILTER_ALPHA * (roll + rollRate * dt) +
-        (1.0f - FILTER_ALPHA) * accelRoll;
+    pitch = updateAdaptiveComplementaryAngle(
+        pitch, gyroRate, accelPitch, dt, currentAccelerationTrust,
+        ATTITUDE_FILTER_TIME_CONSTANT_SEC);
+    roll = updateAdaptiveComplementaryAngle(
+        roll, rollRate, accelRoll, dt, currentAccelerationTrust,
+        ATTITUDE_FILTER_TIME_CONSTANT_SEC);
 
     currentAbsolutePitch = PITCH_SIGN * (pitch - pitchZero);
     currentRollAngle = roll - rollZero;
@@ -3338,6 +3791,7 @@ void setup() {
     pinMode(USER_BUTTON_PIN, INPUT_PULLUP);
 
     loadSettings();
+    loadRiderModel();
     Serial.printf("Accepted OTA channel: %s\n", otaChannel.c_str());
     writeToken = makeWriteToken();
     initializeRideLogging();
@@ -3438,6 +3892,7 @@ void loop() {
         controllerState = ControllerState::NORMAL;
         forceOutputOff();
     }
+    updateRiderModel();
     updateRideLogging();
 
     updateDisplay();
