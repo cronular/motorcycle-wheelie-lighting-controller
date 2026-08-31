@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,7 +46,7 @@ class FirmwarePackageTests(unittest.TestCase):
             output=str(self.package),
             board="seeed_xiao_esp32s3",
             chip="esp32s3",
-            version="v0.12.0-testing",
+            version="v0.13.0",
             channel="testing",
             commit="0123456789ab",
             built="2026-08-30T12:00:00Z",
@@ -60,8 +61,10 @@ class FirmwarePackageTests(unittest.TestCase):
         manifest, _, firmware = package_firmware.parse_package(self.package)
         fields = package_firmware.parse_manifest(manifest)
         self.assertEqual(fields["board"], "seeed_xiao_esp32s3")
+        self.assertEqual(fields["version"], "v0.13.0")
         self.assertEqual(fields["channel"], "testing")
         self.assertEqual(len(firmware), 8192)
+        self.assertEqual(firmware, self.firmware.read_bytes())
 
     def test_firmware_tampering_is_rejected(self) -> None:
         package_firmware.package_firmware(self.package_args())
@@ -93,6 +96,13 @@ class FirmwarePackageTests(unittest.TestCase):
         )
         for line in public_lines:
             self.assertIn(line, header)
+
+    def test_embedded_version_is_channel_agnostic_semver(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        source = (repository / "src" / "main.cpp").read_text(encoding="utf-8")
+        match = re.search(r'FIRMWARE_VERSION = "([^"]+)"', source)
+        self.assertIsNotNone(match)
+        self.assertRegex(match.group(1), r"^v\d+\.\d+\.\d+$")
 
 
 if __name__ == "__main__":

@@ -108,11 +108,24 @@ update partition is activated, the device verifies:
 - the device's selected `stable` or `testing` channel.
 
 `main` publishes the rolling `ota-stable` release and `testing` publishes
-`ota-testing`. Tagged `v*` releases must come from `main`, must match the embedded
-firmware version, and publish a signed OTA package plus a detached signature for
-the release checksum file. Raw factory images are retained for wired recovery.
-The Settings page selects the accepted OTA channel and shows build commit, build
-date, compiled release channel, and hardware target.
+`ota-testing`. Release titles and downloadable firmware filenames retain the
+embedded version number, while the manifest separately records the stable or
+testing channel. Tagged `v*` releases must come from `main`, must match the
+embedded firmware version, and publish a signed OTA package plus a detached
+signature for the release checksum file. Raw factory images are retained for
+wired recovery. The Settings page selects the accepted OTA channel and shows
+build commit, build date, compiled release channel, and hardware target.
+
+### Migrating from v0.11.0
+
+v0.11.0 predates signed `.wctrl` packages, but its Settings page can perform a
+one-time web OTA using the versioned `v0.11-migration.bin` asset from the
+`ota-stable` or matching tagged release. Upload that raw migration image while
+running v0.11.0, wait for the controller to reboot, then use signed `.wctrl`
+packages for every later update. The migration image is the same stable app
+image carried inside the signed package and is covered by the release's signed
+`SHA256SUMS.txt`. A USB reflash is only needed if the old web updater is
+unavailable or fails.
 
 The trusted public key and key-rotation procedure are documented in
 [security/README.md](security/README.md). The private key must only be stored in

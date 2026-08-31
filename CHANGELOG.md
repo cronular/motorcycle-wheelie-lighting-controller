@@ -7,6 +7,11 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+## [0.13.0] - 2026-08-30
+
+First versioned release of the mounting, secure OTA, telemetry, and Rider HUD
+work developed after v0.11.0.
+
 ### Added
 
 - First-run OLED mounting wizard that detects upright, roll, and pitch axes from
@@ -21,11 +26,20 @@ Changes under active evaluation on the `testing` branch.
   configuration changes.
 - Optional per-device Wi-Fi password generation from the Settings page.
 - Firmware build commit, build date, release channel, and target diagnostics.
+- Opt-in 5 Hz ride telemetry limited to 90 minutes and the newest three sessions.
+- Downloadable HTML ride reports and CSV data with sample-stream SHA-256 proofs.
+- Rider HUD with calibrated lean angle, warning/trigger markers, sunlight mode,
+  and shared hold-to-arm/disarm controls.
+- Stable-only one-time raw OTA bridge for migrating v0.11.0 devices to signed
+  firmware without requiring a USB reflash.
 
 ### Changed
 
 - Dashboard OTA now accepts signed `.wctrl` packages only; raw `.bin` files
-  remain available solely for wired/factory flashing.
+  remain available solely for wired/factory flashing and the documented
+  v0.11.0-to-stable migration bridge.
+- Rolling and tagged release titles, manifests, and firmware assets retain the
+  `v0.13.0` firmware version while channel metadata remains separate.
 
 ## [0.11.0] - 2026-08-29
 
@@ -44,5 +58,6 @@ Changes under active evaluation on the `testing` branch.
 - Output defaults off, shuts down on sustained IMU failure, and remains off
   during firmware updates, calibration failures, and standby operation.
 
-[Unreleased]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.11.0...v0.13.0
 [0.11.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/releases/tag/v0.11.0
