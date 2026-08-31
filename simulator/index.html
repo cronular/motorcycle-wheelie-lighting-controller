@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Wheelie Controller Lab</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=phone-client-2">
 </head>
 <body>
   <main class="shell">
@@ -61,6 +61,7 @@
       <article class="card controls">
         <div class="card-title"><div><span>Sensor injection</span><h2>Live inputs</h2></div><span class="hint">Moving a slider selects Manual bench</span></div>
         <label>Absolute pitch <output id="pitchOut">0.0°</output><input id="pitchInput" type="range" min="-20" max="75" step="0.1" value="0"></label>
+        <label>Lean angle <output id="rollOut">0.0°</output><input id="rollInput" type="range" min="-55" max="55" step="0.1" value="0"></label>
         <label>Gyroscope pitch rate <output id="gyroOut">0.0°/s</output><input id="gyroInput" type="range" min="-120" max="120" step="1" value="0"></label>
         <label>Dynamic linear acceleration <output id="gOut">0.00 g</output><input id="gInput" type="range" min="0" max="2.5" step="0.01" value="0"></label>
         <div class="button-emulation"><span>Physical button gestures</span><button data-gesture="single">1× Page</button><button data-gesture="double">2× Angle</button><button data-gesture="triple">3× Wi-Fi</button><button data-gesture="hold">Hold Arm</button></div>
@@ -69,6 +70,21 @@
       <article class="card oled-card">
         <div class="card-title"><div><span>SSD1306 output</span><h2>Virtual OLED</h2></div><b id="oledPage">PAGE 1/4</b></div>
         <pre id="oled" class="oled" aria-label="OLED text display"></pre>
+      </article>
+
+      <article class="card phone-card">
+        <div class="card-title"><div><span>Connected client</span><h2>Rider's phone</h2></div><div class="phone-status"><i id="phoneDot"></i><b id="phoneStatus">CONNECTING</b></div></div>
+        <div class="phone-shell">
+          <div class="phone-hardware"><span></span></div>
+          <div class="phone-browser"><i></i><strong id="phoneAddress">wheelie.local</strong><button id="reloadPhone" type="button" aria-label="Reload phone">↻</button></div>
+          <iframe id="phoneFrame" src="/phone/" title="Connected phone showing the firmware dashboard"></iframe>
+          <div class="phone-home"></div>
+        </div>
+        <div class="phone-actions" aria-label="Phone navigation">
+          <button data-phone-page="/phone/" class="active">Dashboard</button>
+          <button data-phone-page="/phone/settings">Settings</button>
+        </div>
+        <p class="phone-note">iPhone 17 portrait viewport (402 × 874 points). This is the exact web interface embedded in the firmware, sharing live telemetry and controls with the virtual motorcycle.</p>
       </article>
 
       <article class="card settings-card">
@@ -96,6 +112,6 @@
     </section>
     <footer>This simulator executes the controller at 100 Hz. Native C++ tests remain the source of truth for shared production logic.</footer>
   </main>
-  <script src="simulator.js"></script>
+  <script src="simulator.js?v=rider-hud-1"></script>
 </body>
 </html>

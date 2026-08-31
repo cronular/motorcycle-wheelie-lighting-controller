@@ -7,7 +7,7 @@
 [![Firmware CI](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/cronular/motorcycle-wheelie-lighting-controller?display_name=tag)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/releases/latest)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-XIAO_ESP32--S3-orange)](https://platformio.org/)
-[![Tests](https://img.shields.io/badge/native_tests-27-brightgreen)](#test-without-hardware)
+[![Tests](https://img.shields.io/badge/native_tests-30-brightgreen)](#test-without-hardware)
 [![Live simulator](https://img.shields.io/badge/try-live_simulator-48e0d0)](https://cronular.github.io/motorcycle-wheelie-lighting-controller/)
 
 </div>
@@ -28,8 +28,10 @@ dashboard.
 - High-angle and pitch-rate warning behavior with safe IMU-failure shutdown.
 - SSD1306 status pages and physical-button gesture controls.
 - First-run mounting wizard with persistent pitch/roll axis detection.
+- Lean-aware Rider HUD with threshold markers, warning banner, and sunlight mode.
 - Local Wi-Fi dashboard, captive portal, OTA update, and rollback support.
 - Signed, board-locked OTA packages with stable and testing channels.
+- Opt-in, bounded ride telemetry with downloadable reports and CSV data.
 - Desktop simulator and native regression tests—no connected board required.
 - Automated GitHub builds with downloadable firmware artifacts and releases.
 
@@ -70,6 +72,31 @@ fades, mounting-axis detection, OTA compatibility, write throttling, validation,
 and complete wheelie profiles. Signed-package tests additionally exercise valid,
 tampered-firmware, and tampered-manifest cases.
 
+## Ride telemetry and reports
+
+Ride logging is **disabled by default** and can be enabled from Settings. While
+enabled, each ARMED-to-STANDBY cycle records a session at 5 Hz for up to 90
+minutes. The controller retains only the newest three sessions in LittleFS and
+automatically overwrites the oldest. Compact 16-byte samples keep the maximum
+three-session footprint to about 1.24 MiB and reserve at least 256 KiB of the
+default 1.5 MiB data partition.
+
+The Settings page can download a styled ride report or the underlying CSV. The
+`DEVICE-RECORDED · SENSOR DATA · SHA-256` mark means that the report came from
+controller telemetry and carries a sample-stream checksum. It is not a
+third-party certification or, in this version, a hardware-backed device
+signature. Simulator exports are separately marked `SIMULATOR-RECORDED`.
+
+## Rider dashboard
+
+The phone dashboard keeps controller mode, connection state, light output, and
+ride-recording status visible at all times. Its Rider HUD combines pitch,
+trigger/warning markers, an explicit high-angle warning, and an optional lean
+gauge driven by the mounting wizard's calibrated roll axis. The Telemetry view
+adds roll rate, recent pitch history, event summaries, and shortcuts to the
+latest ride report. Arming requires a deliberate hold, while calibration is a
+separate control. Dark, day, and high-contrast sunlight themes are available.
+
 ## Secure OTA updates
 
 Dashboard OTA accepts signed `.wctrl` packages—not raw `.bin` files. Before an
@@ -98,9 +125,13 @@ python tools/run_simulator.py
 ```
 
 The lab opens at <http://127.0.0.1:8765/> with virtual XIAO, MPU6050, OLED,
-MOSFET, and lighting components. It includes manual sensor injection plus clean
-wheelie, short-blip, hill, warning, and IMU-disconnect scenarios. Press `Ctrl+C`
-to stop it, or smoke-test it with `python tools/run_simulator.py --check`.
+MOSFET, and lighting components. It includes manual pitch, lean, gyro, and
+acceleration injection plus clean wheelie, short-blip, hill, warning, and
+IMU-disconnect scenarios. A simulated
+rider phone runs the exact dashboard and settings pages embedded in the firmware,
+with live telemetry and controls bridged to the virtual motorcycle. Press
+`Ctrl+C` to stop it, or smoke-test it with
+`python tools/run_simulator.py --check`.
 
 The current `main` version is also hosted as a
 [live GitHub Pages simulator](https://cronular.github.io/motorcycle-wheelie-lighting-controller/).
