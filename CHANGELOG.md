@@ -7,6 +7,34 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+## [0.14.0] - 2026-08-31
+
+### Added
+
+- Persistent rider profile that learns stable gyro and acceleration-residual
+  distributions without changing the safety-critical controller state machine;
+  the feature is opt-in and disabled by default.
+- Advisory-only 50 Hz shadow event model with two seconds of pre-event context,
+  compact feature extraction, and a twelve-event NVS history.
+- Rider Model Lab in Settings for intentional, nuisance, and missed-event
+  feedback plus downloadable feature CSV data.
+- Leakage-safe offline logistic model shaping tool with whole-ride validation.
+- Explicit adaptive baseline states for IMU, controller, motion, and external
+  acceleration holds.
+
+### Changed
+
+- Firmware version advanced to `v0.14.0` for calibration and filtering work.
+- Pitch and roll now use time-based complementary filtering that reduces
+  accelerometer correction during launches, braking, bumps, and vibration.
+- Gyro rate used by warning and adaptive-baseline logic is separately smoothed.
+- Adaptive freeze rate now respects a bounded, measured three-sigma noise floor.
+
+### Fixed
+
+- Turning the high-angle warning pattern Off no longer suppresses the ordinary
+  wheelie light while the warning state is active.
+
 ## [0.13.0] - 2026-08-30
 
 First versioned release of the mounting, secure OTA, telemetry, and Rider HUD

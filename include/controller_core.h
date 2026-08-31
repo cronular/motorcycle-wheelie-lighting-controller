@@ -38,6 +38,13 @@ struct ControllerSettings {
 };
 
 enum class ControllerState : uint8_t { NORMAL, TRIGGER_PENDING, WHEELIE };
+enum class AdaptiveFreezeReason : uint8_t {
+    NONE = 0,
+    IMU_UNHEALTHY = 1,
+    CONTROLLER_ACTIVE = 2,
+    MOTION = 3,
+    ACCELERATION = 4,
+};
 
 constexpr uint16_t FIRMWARE_PACKAGE_HEADER_SIZE = 16;
 constexpr uint8_t FIRMWARE_PACKAGE_MAGIC[8] = {'W', 'C', 'T', 'R', 'L', '1', '\r', '\n'};
@@ -60,6 +67,46 @@ enum class WriteRateLimitDecision : uint8_t { ALLOW, BLOCK };
 // Arduino/ESP32 dependencies.
 inline float controllerClamp(float value, float low, float high) {
     return value < low ? low : (value > high ? high : value);
+}
+
+inline float timeConstantGyroWeight(float timeConstantSec, float dt) {
+    const float safeTau = fmaxf(timeConstantSec, 0.001f);
+    const float safeDt = fmaxf(dt, 0.0f);
+    return controllerClamp(safeTau / (safeTau + safeDt), 0.0f, 1.0f);
+}
+
+inline float calculateAccelerationTrust(float accelerationMagnitudeG) {
+    if (!isfinite(accelerationMagnitudeG)) return 0.0f;
+    const float residual = fabsf(accelerationMagnitudeG - 1.0f);
+    // Full accelerometer correction near 1 g, smoothly fading to gyro-only
+    // once launches, braking, bumps, or vibration disturb the gravity vector.
+    return controllerClamp(1.0f - residual / 0.20f, 0.0f, 1.0f);
+}
+
+inline float updateAdaptiveComplementaryAngle(
+    float angle,
+    float gyroRateDegSec,
+    float accelerometerAngle,
+    float dt,
+    float accelerometerTrust,
+    float timeConstantSec = 0.49f
+) {
+    const float predicted = angle + gyroRateDegSec * fmaxf(dt, 0.0f);
+    const float gyroWeight = timeConstantGyroWeight(timeConstantSec, dt);
+    const float correction = (1.0f - gyroWeight) *
+        controllerClamp(accelerometerTrust, 0.0f, 1.0f);
+    return predicted + (accelerometerAngle - predicted) * correction;
+}
+
+inline float updateLowPass(float previous, float sample, float dt, float timeConstantSec) {
+    const float safeDt = fmaxf(dt, 0.0f);
+    const float alpha = safeDt / (fmaxf(timeConstantSec, 0.001f) + safeDt);
+    return previous + (sample - previous) * controllerClamp(alpha, 0.0f, 1.0f);
+}
+
+inline float calculateNoiseAwareFreezeRate(float configuredRate, float gyroNoiseRms) {
+    const float measuredFloor = isfinite(gyroNoiseRms) ? gyroNoiseRms * 3.0f : 0.0f;
+    return controllerClamp(fmaxf(configuredRate, measuredFloor), 1.0f, 25.0f);
 }
 
 inline uint16_t readLittleEndian16(const uint8_t* data) {
@@ -291,24 +338,41 @@ inline float processTriggerPitch(
     bool controllerAllowsTracking,
     const ControllerSettings& settings,
     float& adaptiveBaseline,
-    bool& adaptiveBaselineFrozen
+    bool& adaptiveBaselineFrozen,
+    AdaptiveFreezeReason* freezeReason = nullptr,
+    float trackingConfidence = 1.0f,
+    float effectiveFreezeRateDegSec = 0.0f
 ) {
     if (settings.angleMode == AngleMode::ABSOLUTE) {
         adaptiveBaseline = 0.0f;
         adaptiveBaselineFrozen = false;
+        if (freezeReason != nullptr) *freezeReason = AdaptiveFreezeReason::NONE;
         return absolutePitch;
     }
 
+    const float freezeRate = effectiveFreezeRateDegSec > 0.0f
+        ? effectiveFreezeRateDegSec : settings.adaptiveFreezeRateDegSec;
     const bool gyroAllowsTracking =
-        fabsf(gyroRate) < settings.adaptiveFreezeRateDegSec;
+        fabsf(gyroRate) < freezeRate;
+    const bool accelerationAllowsTracking = trackingConfidence >= 0.15f;
     const bool canTrack =
-        imuHealthy && controllerAllowsTracking && gyroAllowsTracking;
+        imuHealthy && controllerAllowsTracking && gyroAllowsTracking &&
+        accelerationAllowsTracking;
 
     adaptiveBaselineFrozen = !canTrack;
+    if (freezeReason != nullptr) {
+        if (!imuHealthy) *freezeReason = AdaptiveFreezeReason::IMU_UNHEALTHY;
+        else if (!controllerAllowsTracking) *freezeReason = AdaptiveFreezeReason::CONTROLLER_ACTIVE;
+        else if (!gyroAllowsTracking) *freezeReason = AdaptiveFreezeReason::MOTION;
+        else if (!accelerationAllowsTracking) *freezeReason = AdaptiveFreezeReason::ACCELERATION;
+        else *freezeReason = AdaptiveFreezeReason::NONE;
+    }
     if (canTrack) {
         const float safeDt = dt > 0.0f ? dt : 0.0f;
         const float tau = fmaxf(settings.adaptiveTimeConstantSec, 0.5f);
-        const float alpha = controllerClamp(safeDt / (tau + safeDt), 0.0f, 1.0f);
+        const float alpha = controllerClamp(
+            (safeDt / (tau + safeDt)) * controllerClamp(trackingConfidence, 0.0f, 1.0f),
+            0.0f, 1.0f);
         adaptiveBaseline += (absolutePitch - adaptiveBaseline) * alpha;
     }
 
@@ -361,6 +425,26 @@ inline uint8_t calculatePatternBrightness(
         }
         case LightPattern::STROBE:
             return (now % 320UL) < 95UL ? brightness : 0;
+    }
+    return 0;
+}
+
+inline uint8_t calculateRequestedBrightness(
+    bool warningActive,
+    bool wheelieOutputOn,
+    LightPattern warningPattern,
+    uint8_t warningBrightness,
+    LightPattern wheeliePattern,
+    uint8_t wheelieBrightness,
+    unsigned long now
+) {
+    // An explicitly disabled warning is observational only; it must not
+    // suppress the normal wheelie output when the warning state is active.
+    if (warningActive && warningPattern != LightPattern::OFF) {
+        return calculatePatternBrightness(warningPattern, warningBrightness, now);
+    }
+    if (wheelieOutputOn) {
+        return calculatePatternBrightness(wheeliePattern, wheelieBrightness, now);
     }
     return 0;
 }

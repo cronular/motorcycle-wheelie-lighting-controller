@@ -41,8 +41,8 @@ jobs:
       - name: Run native regression suite
         run: pio test -e native
 
-      - name: Test signed firmware packaging
-        run: python -m unittest discover -s test -p test_package_firmware.py
+      - name: Test firmware packaging and model shaping
+        run: python -m unittest discover -s test -p "test_*.py"
 
       - name: Smoke-test desktop simulator
         run: |

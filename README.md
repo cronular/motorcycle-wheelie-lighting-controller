@@ -7,7 +7,7 @@
 [![Firmware CI](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml/badge.svg)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/cronular/motorcycle-wheelie-lighting-controller?display_name=tag)](https://github.com/cronular/motorcycle-wheelie-lighting-controller/releases/latest)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-XIAO_ESP32--S3-orange)](https://platformio.org/)
-[![Tests](https://img.shields.io/badge/native_tests-30-brightgreen)](#test-without-hardware)
+[![Tests](https://img.shields.io/badge/native_tests-35-brightgreen)](#test-without-hardware)
 [![Live simulator](https://img.shields.io/badge/try-live_simulator-48e0d0)](https://cronular.github.io/motorcycle-wheelie-lighting-controller/)
 
 </div>
@@ -32,6 +32,7 @@ dashboard.
 - Local Wi-Fi dashboard, captive portal, OTA update, and rollback support.
 - Signed, board-locked OTA packages with stable and testing channels.
 - Opt-in, bounded ride telemetry with downloadable reports and CSV data.
+- Advisory rider model with bounded event features and explicit rider labels.
 - Desktop simulator and native regression tests—no connected board required.
 - Automated GitHub builds with downloadable firmware artifacts and releases.
 
@@ -63,14 +64,16 @@ Arduino-ESP32 3.3.11 and ESP-IDF 5.5.5 consistently.
 
 ```powershell
 pio test -e native
+python -m unittest discover -s test -p "test_*.py"
 ```
 
 PlatformIO provisions the project-local Windows compiler automatically. The
 suite executes the same portable helpers used by the firmware and covers state
 transitions, timing, hysteresis, rollover, adaptive tracking, warnings, patterns,
 fades, mounting-axis detection, OTA compatibility, write throttling, validation,
-and complete wheelie profiles. Signed-package tests additionally exercise valid,
-tampered-firmware, and tampered-manifest cases.
+complete wheelie profiles, adaptive sensor confidence, and bounded rider-model
+features. Python tests additionally exercise signed firmware packaging and the
+offline model-shaping pipeline.
 
 ## Ride telemetry and reports
 
@@ -96,6 +99,35 @@ gauge driven by the mounting wizard's calibrated roll axis. The Telemetry view
 adds roll rate, recent pitch history, event summaries, and shortcuts to the
 latest ride report. Arming requires a deliberate hold, while calibration is a
 separate control. Dark, day, and high-contrast sunlight themes are available.
+
+## Rider model lab
+
+v0.14 adds an optional, advisory-only rider model alongside the deterministic
+controller. It is disabled by default and must be enabled in Settings.
+It learns the stable gyro and acceleration-residual distributions for this
+motorcycle, derives a bounded noise-aware baseline freeze recommendation, and records up
+to twelve compact 50 Hz event summaries. Two seconds of pre-event samples feed
+feature extraction; raw high-rate streams are not retained, so the feature
+history remains small and ride telemetry keeps its existing three-session cap.
+
+The Settings page shows model confidence and recent shadow scores. A rider can
+label an event as intentional or nuisance, or mark a missed event. The score is
+diagnostic only: it cannot arm the controller, trigger the light, relax IMU
+health checks, or modify warning limits.
+
+Download feature CSV files from several rides and shape a transparent logistic
+model with:
+
+```powershell
+python tools/shape_rider_model.py exports\ride-1.csv exports\ride-2.csv -o rider-model.json
+```
+
+The tool ignores unlabeled events, requires both positive and nuisance labels,
+balances the two classes, and validates by holding out complete ride sessions
+instead of randomly mixing adjacent events. Treat results from fewer than 20
+labeled events across multiple rides as preliminary. Generated JSON remains an
+offline research artifact until its versioned coefficients are deliberately
+reviewed, tested, and added to firmware.
 
 ## Secure OTA updates
 

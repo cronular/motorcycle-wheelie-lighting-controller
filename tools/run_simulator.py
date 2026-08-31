@@ -114,7 +114,10 @@ def main():
     if missing:
         raise SystemExit("Missing simulator files: " + ", ".join(missing))
     simulator_script = (SIMULATOR_DIR / "simulator.js").read_text(encoding="utf-8")
-    bridge_markers = ("wheelieSimulatorApi", "phoneStatusSnapshot", '"/api/settings"')
+    bridge_markers = (
+        "wheelieSimulatorApi", "phoneStatusSnapshot", '"/api/settings"',
+        '"/api/model"', '"/api/model/feedback"'
+    )
     if any(marker not in simulator_script for marker in bridge_markers):
         raise SystemExit("Simulator phone API bridge is incomplete")
 
@@ -125,22 +128,45 @@ def main():
     if args.check:
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
-        with urllib.request.urlopen(url, timeout=3) as response:
-            body = response.read().decode("utf-8")
-            if response.status != 200 or "Wheelie Controller Lab" not in body or 'src="/phone/"' not in body:
-                raise SystemExit("Simulator HTTP smoke test failed")
-        with urllib.request.urlopen(url + "phone/", timeout=3) as response:
-            body = response.read().decode("utf-8")
-            if (response.status != 200 or "wheelieSimulatorApi" not in body or
-                    '/phone/settings' not in body or "Rider HUD" not in body or
-                    'id="leanGauge"' not in body):
-                raise SystemExit("Phone dashboard bridge smoke test failed")
-        with urllib.request.urlopen(url + "phone/settings", timeout=3) as response:
-            body = response.read().decode("utf-8")
-            if (response.status != 200 or "Controller Settings" not in body or
-                    'href="/phone/"' not in body or 'id="leanGaugeSetting"' not in body):
-                raise SystemExit("Phone settings bridge smoke test failed")
-        server.shutdown()
+        try:
+            with urllib.request.urlopen(url, timeout=3) as response:
+                body = response.read().decode("utf-8")
+                checks = {
+                    "http-200": response.status == 200,
+                    "lab-title": "Wheelie Controller Lab" in body,
+                    "phone-frame": 'src="/phone/"' in body,
+                }
+                missing = [name for name, passed in checks.items() if not passed]
+                if missing:
+                    raise SystemExit("Simulator HTTP smoke test failed: " + ", ".join(missing))
+            with urllib.request.urlopen(url + "phone/", timeout=3) as response:
+                body = response.read().decode("utf-8")
+                checks = {
+                    "http-200": response.status == 200,
+                    "api-bridge": "wheelieSimulatorApi" in body,
+                    "settings-link": "/phone/settings" in body,
+                    "rider-hud": "Rider HUD" in body,
+                    "lean-gauge": 'id="leanGauge"' in body,
+                }
+                missing = [name for name, passed in checks.items() if not passed]
+                if missing:
+                    raise SystemExit("Phone dashboard bridge smoke test failed: " + ", ".join(missing))
+            with urllib.request.urlopen(url + "phone/settings", timeout=3) as response:
+                body = response.read().decode("utf-8")
+                checks = {
+                    "http-200": response.status == 200,
+                    "settings-title": "Controller Settings" in body,
+                    "dashboard-link": 'href="/phone/"' in body,
+                    "lean-setting": 'id="leanGaugeSetting"' in body,
+                    "model-setting": 'id="riderModel"' in body,
+                    "model-events": 'id="modelEvents"' in body,
+                }
+                missing = [name for name, passed in checks.items() if not passed]
+                if missing:
+                    raise SystemExit("Phone settings bridge smoke test failed: " + ", ".join(missing))
+        finally:
+            server.shutdown()
+            server.server_close()
         print("Simulator smoke test passed")
         return
 
