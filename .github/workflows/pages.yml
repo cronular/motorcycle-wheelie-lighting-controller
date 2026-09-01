@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - "simulator/**"
+      - "src/modules/dashboard_module.cpp"
+      - "tools/build_simulator_site.py"
+      - "tools/run_simulator.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -26,9 +29,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/configure-pages@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build simulator site with rider phone pages
+        run: python tools/build_simulator_site.py --output dist/simulator --check
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: simulator
+          path: dist/simulator
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5

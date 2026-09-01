@@ -21,6 +21,6 @@ application again afterward with:
 
     pio run -e seeed_xiao_esp32s3 --target upload
 
-The native tests exercise the same portable helpers used by `src/main.cpp` for
+The native tests exercise the same portable helpers used by the firmware modules for
 wheelie transitions, adaptive angle processing, warning hysteresis, light
 patterns, fades, settings validation, and rollover-safe timing.

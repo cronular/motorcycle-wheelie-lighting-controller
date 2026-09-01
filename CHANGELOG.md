@@ -7,6 +7,24 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+## [0.15.0] - 2026-08-31
+
+### Added
+
+- Fixed-capacity, allocation-free firmware module registry with independently
+  ordered startup and loop phases for future subsystem modules.
+- Module authoring template and architecture documentation covering ownership,
+  lifecycle ordering, safety boundaries, and verification requirements.
+
+### Changed
+
+- Firmware version advanced to `v0.15.0` for the modular architecture work.
+- Split the 3,902-line firmware monolith into sensor, output, storage, network,
+  dashboard, and operating-mode implementation units with an explicit shared
+  runtime and API boundary.
+- Reduced `src/main.cpp` to the application composition root and hardware-safe
+  startup/loop orchestration.
+
 ## [0.14.0] - 2026-08-31
 
 ### Added

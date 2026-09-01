@@ -24,7 +24,7 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor $env:GITHUB_SHA origin/main
           if ($LASTEXITCODE -ne 0) { throw 'Stable release tags must point to a commit on main' }
-          $versionMatch = Select-String -Path src/main.cpp -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
+          $versionMatch = Select-String -Path include/firmware_runtime.h -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
           $firmwareVersion = $versionMatch.Matches[0].Groups[1].Value
           if ($firmwareVersion -ne '${{ github.ref_name }}') {
             throw "Tag ${{ github.ref_name }} does not match embedded firmware version $firmwareVersion"
@@ -42,6 +42,7 @@ jobs:
           python -m unittest discover -s test -p "test_*.py"
           python tools/check_embedded_web.py
           python tools/run_simulator.py --check
+          python tools/build_simulator_site.py --output dist/simulator --check
           pio run -e seeed_xiao_esp32s3
       - name: Sign and package release
         shell: pwsh

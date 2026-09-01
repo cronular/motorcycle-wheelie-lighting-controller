@@ -48,6 +48,7 @@ jobs:
         run: |
           python tools/check_embedded_web.py
           python tools/run_simulator.py --check
+          python tools/build_simulator_site.py --output dist/simulator --check
 
       - name: Build XIAO ESP32-S3 firmware
         shell: pwsh

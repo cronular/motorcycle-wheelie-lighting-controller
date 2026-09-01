@@ -770,7 +770,10 @@ window.wheelieSimulatorApi = {
     $("phoneDot").classList.add("connected");
     $("phoneAddress").textContent = path.includes("settings") ? "wheelie.local/settings" : "wheelie.local";
     document.querySelectorAll("[data-phone-page]").forEach((button) => {
-      button.classList.toggle("active", button.dataset.phonePage === path || (path === "/phone/settings/" && button.dataset.phonePage === "/phone/settings"));
+      const settingsPage = path.includes("/phone/settings");
+      button.classList.toggle("active", settingsPage
+        ? button.dataset.phonePage.includes("settings")
+        : !button.dataset.phonePage.includes("settings"));
     });
   }
 };
