@@ -191,7 +191,9 @@ The current `main` version is also hosted as a
   and a combined factory image when the PlatformIO build produces one.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete workflow and
-[CHANGELOG.md](CHANGELOG.md) for release history.
+[CHANGELOG.md](CHANGELOG.md) for release history. The firmware module layout,
+lifecycle ordering, and extension scaffold are documented in
+[docs/architecture.md](docs/architecture.md).
 
 ## Simulation boundary
 

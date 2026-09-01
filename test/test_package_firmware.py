@@ -99,7 +99,9 @@ class FirmwarePackageTests(unittest.TestCase):
 
     def test_embedded_version_is_channel_agnostic_semver(self) -> None:
         repository = Path(__file__).resolve().parents[1]
-        source = (repository / "src" / "main.cpp").read_text(encoding="utf-8")
+        source = (repository / "include" / "firmware_runtime.h").read_text(
+            encoding="utf-8"
+        )
         match = re.search(r'FIRMWARE_VERSION = "([^"]+)"', source)
         self.assertIsNotNone(match)
         self.assertRegex(match.group(1), r"^v\d+\.\d+\.\d+$")

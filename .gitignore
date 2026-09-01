@@ -1,5 +1,6 @@
 .pio
 .preview/
+dist/
 .env
 .env.*
 *.log

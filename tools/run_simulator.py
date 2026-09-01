@@ -13,7 +13,7 @@ import webbrowser
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SIMULATOR_DIR = PROJECT_DIR / "simulator"
-FIRMWARE_SOURCE = PROJECT_DIR / "src" / "main.cpp"
+FIRMWARE_SOURCE = PROJECT_DIR / "src" / "modules" / "dashboard_module.cpp"
 
 
 PHONE_BRIDGE = r"""
@@ -69,9 +69,9 @@ def embedded_html(name: str) -> str:
 def phone_page(name: str) -> bytes:
     page = embedded_html(name).replace("</head>", PHONE_BRIDGE + "</head>")
     if name == "DASHBOARD_HTML":
-        page = page.replace('href="/settings"', 'href="/phone/settings"')
+        page = page.replace('href="/settings"', 'href="settings/"')
     else:
-        page = page.replace('href="/"', 'href="/phone/"')
+        page = page.replace('href="/"', 'href="../"')
     return page.encode("utf-8")
 
 
@@ -134,7 +134,7 @@ def main():
                 checks = {
                     "http-200": response.status == 200,
                     "lab-title": "Wheelie Controller Lab" in body,
-                    "phone-frame": 'src="/phone/"' in body,
+                    "phone-frame": 'src="phone/"' in body,
                 }
                 missing = [name for name, passed in checks.items() if not passed]
                 if missing:
@@ -144,7 +144,7 @@ def main():
                 checks = {
                     "http-200": response.status == 200,
                     "api-bridge": "wheelieSimulatorApi" in body,
-                    "settings-link": "/phone/settings" in body,
+                    "settings-link": 'href="settings/"' in body,
                     "rider-hud": "Rider HUD" in body,
                     "lean-gauge": 'id="leanGauge"' in body,
                 }
@@ -156,7 +156,7 @@ def main():
                 checks = {
                     "http-200": response.status == 200,
                     "settings-title": "Controller Settings" in body,
-                    "dashboard-link": 'href="/phone/"' in body,
+                    "dashboard-link": 'href="../"' in body,
                     "lean-setting": 'id="leanGaugeSetting"' in body,
                     "model-setting": 'id="riderModel"' in body,
                     "model-events": 'id="modelEvents"' in body,

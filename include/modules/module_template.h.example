@@ -1,0 +1,10 @@
+#pragma once
+
+#include "framework/firmware_module.h"
+
+namespace firmware {
+
+// Rename this accessor and keep feature-specific operations narrow.
+const FirmwareModule& futureFeatureModule();
+
+} // namespace firmware

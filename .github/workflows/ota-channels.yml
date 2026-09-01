@@ -36,6 +36,7 @@ jobs:
           python -m unittest discover -s test -p "test_*.py"
           python tools/check_embedded_web.py
           python tools/run_simulator.py --check
+          python tools/build_simulator_site.py --output dist/simulator --check
           pio run -e seeed_xiao_esp32s3
       - name: Sign channel package
         id: package
@@ -50,7 +51,7 @@ jobs:
           $keyPath = Join-Path $env:RUNNER_TEMP 'firmware-signing-private.pem'
           [IO.File]::WriteAllText($keyPath, $env:FIRMWARE_SIGNING_KEY_PEM)
           New-Item -ItemType Directory -Force channel | Out-Null
-          $versionMatch = Select-String -Path src/main.cpp -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
+          $versionMatch = Select-String -Path include/firmware_runtime.h -Pattern 'FIRMWARE_VERSION = "([^"]+)"'
           $version = $versionMatch.Matches[0].Groups[1].Value
           $built = (git show -s --format=%cI HEAD)
           $package = "channel/wheelie-controller-$version-$channel.wctrl"

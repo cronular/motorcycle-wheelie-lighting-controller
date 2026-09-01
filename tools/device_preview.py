@@ -1,6 +1,6 @@
 """Local browser emulator for the Wheelie Controller web UI.
 
-Serves the exact PROGMEM HTML from src/main.cpp and emulates the REST API.
+Serves the exact PROGMEM HTML from the dashboard module and emulates the REST API.
 No third-party packages are required.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src" / "main.cpp"
+SOURCE = ROOT / "src" / "modules" / "dashboard_module.cpp"
 HOST = "127.0.0.1"
 PORT = 8899
 TOKEN = "LOCAL-PREVIEW"

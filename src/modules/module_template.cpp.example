@@ -1,0 +1,34 @@
+#include "modules/module_template.h"
+
+namespace firmware {
+namespace {
+
+// Private module state stays in this translation unit.
+struct FutureFeatureState {
+    bool ready = false;
+};
+
+FutureFeatureState state;
+
+void beginFutureFeature() {
+    state.ready = true;
+}
+
+void tickFutureFeature() {
+    if (!state.ready) return;
+}
+
+// Leave ordering gaps and document any safety-sensitive dependency.
+const FirmwareModule MODULE = {
+    "future-feature",
+    beginFutureFeature,
+    tickFutureFeature,
+    70,
+    70,
+};
+
+} // namespace
+
+const FirmwareModule& futureFeatureModule() { return MODULE; }
+
+} // namespace firmware

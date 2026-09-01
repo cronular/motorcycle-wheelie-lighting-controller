@@ -5,6 +5,17 @@
 #include "controller_core.h"
 #include "ride_log_format.h"
 #include "rider_model.h"
+#include "framework/firmware_module.h"
+
+namespace {
+int moduleEvents[8] = {};
+size_t moduleEventCount = 0;
+
+void recordBeginA() { moduleEvents[moduleEventCount++] = 11; }
+void recordTickA() { moduleEvents[moduleEventCount++] = 12; }
+void recordBeginB() { moduleEvents[moduleEventCount++] = 21; }
+void recordTickB() { moduleEvents[moduleEventCount++] = 22; }
+}
 
 void setUp() {}
 void tearDown() {}
@@ -395,6 +406,38 @@ void test_ride_log_header_validation_and_opt_in_default() {
     TEST_ASSERT_FALSE(isRideLogHeaderValid(header));
 }
 
+void test_module_registry_uses_independent_lifecycle_order() {
+    moduleEventCount = 0;
+    firmware::ModuleRegistry<2> registry;
+    const firmware::FirmwareModule moduleA = {
+        "a", recordBeginA, recordTickA, 20, 10
+    };
+    const firmware::FirmwareModule moduleB = {
+        "b", recordBeginB, recordTickB, 10, 20
+    };
+
+    TEST_ASSERT_TRUE(registry.add(moduleA));
+    TEST_ASSERT_TRUE(registry.add(moduleB));
+    registry.beginAll();
+    registry.tickAll();
+
+    TEST_ASSERT_EQUAL_UINT32(4, moduleEventCount);
+    TEST_ASSERT_EQUAL_INT(21, moduleEvents[0]);
+    TEST_ASSERT_EQUAL_INT(11, moduleEvents[1]);
+    TEST_ASSERT_EQUAL_INT(12, moduleEvents[2]);
+    TEST_ASSERT_EQUAL_INT(22, moduleEvents[3]);
+}
+
+void test_module_registry_is_fixed_capacity() {
+    firmware::ModuleRegistry<1> registry;
+    const firmware::FirmwareModule module = {"only", nullptr, nullptr, 0, 0};
+    TEST_ASSERT_TRUE(registry.add(module));
+    TEST_ASSERT_FALSE(registry.add(module));
+    TEST_ASSERT_EQUAL_UINT32(1, registry.size());
+    TEST_ASSERT_NOT_NULL(registry.at(0));
+    TEST_ASSERT_NULL(registry.at(1));
+}
+
 static void runAllTests() {
     RUN_TEST(test_trigger_hold);
     RUN_TEST(test_pending_cancellation);
@@ -431,6 +474,8 @@ static void runAllTests() {
     RUN_TEST(test_ride_log_storage_budget);
     RUN_TEST(test_ride_log_compact_record_layout);
     RUN_TEST(test_ride_log_header_validation_and_opt_in_default);
+    RUN_TEST(test_module_registry_uses_independent_lifecycle_order);
+    RUN_TEST(test_module_registry_is_fixed_capacity);
 }
 
 #ifdef ARDUINO
