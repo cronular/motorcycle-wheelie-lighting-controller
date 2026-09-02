@@ -192,6 +192,17 @@ void updateDisplay() {
         return;
     }
 
+    if (operatingMode == OperatingMode::CAPTURE) {
+        oled.clearLine(0); oledPrintRow(0, "DATA CAPTURE");
+        oled.clearLine(1); oledPrintRow(1, imuHealthy ? "IMU:OK LIGHT:OFF" : "IMU:FAULT");
+        char line[17];
+        snprintf(line, sizeof(line), "EVENTS:%u", modelEventHistory.count);
+        oled.clearLine(2); oledPrintRow(2, line);
+        oled.clearLine(3); oledPrintRow(3, "USE PHONE TO MARK");
+        for (uint8_t row = 4; row < 8; ++row) oled.clearLine(row);
+        return;
+    }
+
     switch (displayPage) {
         case DisplayPage::STATUS: drawStatusPage(); break;
         case DisplayPage::SETTINGS: drawSettingsPage(); break;
@@ -256,6 +267,7 @@ body[data-theme="light"] .safetyChip,body[data-theme="light"] .stat,body[data-th
         <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9Z"/></svg>
       </button>
       <button class="iconBtn" id="rideBtn" type="button" aria-label="Open full-screen riding view" title="Riding view">⛶</button>
+      <a class="iconBtn" href="/capture" aria-label="Open data capture" title="Data capture">●</a>
       <a class="iconBtn" href="/settings" aria-label="Settings" title="Settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a4 4 0 0 0-5 5L3 18l3 3 6.7-6.7a4 4 0 0 0 5-5l-2.5 2.5-3-3 2.5-2.5Z"/></svg>
       </a>
@@ -374,7 +386,7 @@ new MutationObserver(()=>{const armed=$('mode').textContent==='ARMED';$('mode').
 new MutationObserver(()=>{const angle=clamp(parseFloat($('pitch').textContent)||0,-60,60);$('pitchTape').style.transform='translateY('+(angle*3)+'px)';updateStageEffect()}).observe($('pitch'),{childList:true});
 new MutationObserver(updateStageEffect).observe($('state'),{childList:true});
 const modeButtons=[$('modeControl'),$('quickModeChip')];
-async function toggleMode(){if(!token)return;const next=$('mode').textContent==='ARMED'?'standby':'armed';modeButtons.forEach(button=>button.disabled=true);try{const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+next,{method:'POST'});if(!r.ok)alert(await r.text());await refresh();}catch(e){alert('Controller connection lost');}finally{modeButtons.forEach(button=>button.disabled=false)}}
+async function toggleMode(){if(!token)return;const shown=$('mode').textContent,next=shown==='ARMED'||shown==='CAPTURE'?'standby':'armed';modeButtons.forEach(button=>button.disabled=true);try{const r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+next,{method:'POST'});if(!r.ok)alert(await r.text());await refresh();}catch(e){alert('Controller connection lost');}finally{modeButtons.forEach(button=>button.disabled=false)}}
 let modeHoldStarted=0,modeHoldFrame=0,modeHoldButton=null;
 function clearModeHold(){cancelAnimationFrame(modeHoldFrame);modeHoldStarted=0;if(modeHoldButton){modeHoldButton.classList.remove('holding');modeHoldButton.style.setProperty('--hold-progress','0%')}modeHoldButton=null}
 async function recalibrateFromTile(){if(!confirm('Recalibrate the controller now? Keep the motorcycle level and completely still.'))return;const button=$('calibrateButton');button.disabled=true;try{const r=await fetch('/api/calibrate?token='+encodeURIComponent(token),{method:'POST'});alert(await r.text());await refresh()}catch(e){alert('Calibration request failed')}finally{button.disabled=false}}
@@ -389,6 +401,14 @@ refresh();refreshRideSummary();setInterval(()=>{if(!document.hidden)refresh()},1
 </script>
 </body>
 </html>
+)rawliteral";
+
+const char CAPTURE_HTML[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Data Capture</title><style>
+:root{color-scheme:dark;--bg:#070b11;--panel:#111923;--line:#29384b;--text:#f4f8fc;--muted:#91a0b2;--blue:#4ca6ff;--green:#52df9a;--red:#ff6577}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% -15%,rgba(76,166,255,.24),transparent 40%),var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}.wrap{width:min(680px,100%);min-height:100vh;margin:auto;padding:18px;display:flex;flex-direction:column}.top{display:flex;align-items:center;gap:12px}.back{width:46px;height:46px;display:grid;place-items:center;border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--text);text-decoration:none;font-size:25px}.title h1{margin:0;font-size:25px}.title p{margin:3px 0 0;color:var(--muted);font-size:12px}.status{margin-top:22px;padding:17px;border:1px solid var(--line);border-radius:18px;background:linear-gradient(180deg,#151f2c,#0e151e)}.statusHead{display:flex;align-items:center;justify-content:space-between;gap:12px}.badge{padding:7px 11px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:11px;font-weight:850;letter-spacing:.08em}.badge.live{border-color:#286848;background:#123323;color:#75efb3}.rows{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:14px}.row{padding:11px;border:1px solid var(--line);border-radius:12px;background:#091019}.row span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.08em}.row strong{display:block;margin-top:5px;font-size:16px}.captureArea{flex:1;display:grid;place-items:center;padding:30px 0}.eventBtn{width:min(76vw,330px);aspect-ratio:1;border:8px solid #17283a;border-radius:50%;background:radial-gradient(circle at 38% 30%,#78d7ff,#2878df 58%,#174eaa);box-shadow:0 0 0 2px #4ca6ff,0 22px 70px rgba(32,126,235,.42),inset 0 -15px 30px rgba(0,0,0,.2);color:white;font:900 clamp(25px,7vw,38px)/1 system-ui;letter-spacing:.04em;cursor:pointer;touch-action:manipulation}.eventBtn:active{transform:scale(.96)}.eventBtn:disabled{filter:grayscale(.8);opacity:.45;cursor:not-allowed;box-shadow:none}.hint{margin-top:15px;color:var(--muted);font-size:12px;text-align:center}.actions{display:grid;gap:10px;padding-bottom:max(6px,env(safe-area-inset-bottom))}.action{min-height:52px;border:1px solid var(--line);border-radius:14px;background:#172334;color:var(--text);font:750 14px system-ui;cursor:pointer}.primary{background:linear-gradient(135deg,#317fdc,#7257dc);border:0}.download{display:grid;place-items:center;text-decoration:none}.message{min-height:20px;margin:10px 0 0;color:var(--muted);font-size:12px;text-align:center}.fault{color:var(--red)}
+</style></head><body><main class="wrap"><header class="top"><a class="back" href="/" aria-label="Back to dashboard">‹</a><div class="title"><h1>Data Capture</h1><p>50 Hz event collection · light output locked off</p></div></header><section class="status"><div class="statusHead"><strong>Capture status</strong><span class="badge" id="badge">CONNECTING</span></div><div class="rows"><div class="row"><span>Controller</span><strong id="mode">---</strong></div><div class="row"><span>IMU</span><strong id="imu">---</strong></div><div class="row"><span>Pitch</span><strong id="pitch">0.0°</strong></div><div class="row"><span>Saved events</span><strong id="events">0</strong></div></div></section><section class="captureArea"><div><button class="eventBtn" id="eventBtn" type="button" disabled>MARK<br>EVENT</button><p class="hint">Saves the preceding two seconds of sensor activity.</p></div></section><div class="actions"><button class="action primary" id="modeBtn" type="button">ENTER CAPTURE MODE</button><a class="action download" href="/api/model/events.csv" download="wheelie-capture-events.csv">DOWNLOAD CAPTURE DATA</a></div><p class="message" id="message"></p></main><script>
+const $=id=>document.getElementById(id);let token='',active=false,busy=false;async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'}),d=await r.json();token=d.token;active=d.mode==='CAPTURE';$('mode').textContent=d.mode;$('imu').textContent=d.imu?'OK':'FAULT';$('imu').className=d.imu?'':'fault';$('pitch').textContent=d.pitch.toFixed(1)+'°';$('events').textContent=d.modelEventCount;$('badge').textContent=active?'RECORDING':'SAFE / IDLE';$('badge').className='badge'+(active?' live':'');$('eventBtn').disabled=!active||!d.imu||busy;$('modeBtn').textContent=active?'EXIT TO STANDBY':'ENTER CAPTURE MODE'}catch(e){$('badge').textContent='DISCONNECTED';$('badge').className='badge fault';$('eventBtn').disabled=true}}async function setMode(){if(!token||busy)return;busy=true;try{const mode=active?'standby':'capture',r=await fetch('/api/mode?token='+encodeURIComponent(token)+'&mode='+mode,{method:'POST'});$('message').textContent=await r.text();if(!r.ok)throw new Error()}catch(e){$('message').textContent='Unable to change capture mode'}finally{busy=false;refresh()}}async function markEvent(){if(!token||!active||busy)return;busy=true;$('eventBtn').disabled=true;try{const r=await fetch('/api/model/feedback?token='+encodeURIComponent(token)+'&label=missed',{method:'POST'});$('message').textContent=await r.text();if(!r.ok)throw new Error()}catch(e){if(!$('message').textContent)$('message').textContent='Event capture failed'}finally{busy=false;refresh()}}$('modeBtn').onclick=setMode;$('eventBtn').onclick=markEvent;refresh();setInterval(refresh,750);
+</script></body></html>
 )rawliteral";
 
 const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
@@ -461,6 +481,10 @@ void handleRoot() {
 
 void handleSettingsPage() {
     server.send_P(200, "text/html", SETTINGS_HTML);
+}
+
+void handleCapturePage() {
+    server.send_P(200, "text/html", CAPTURE_HTML);
 }
 
 void handleCaptivePortalRedirect() {
@@ -661,12 +685,17 @@ void handleRiderModelFeedback() {
     }
     const String label = server.arg("label");
     if (label == "missed") {
-        if (!riderModelEnabled) {
-            server.send(409, "text/plain", "Enable Rider Model Lab in Settings first");
+        if (!riderModelEnabled && operatingMode != OperatingMode::CAPTURE) {
+            server.send(409, "text/plain", "Enter Data Capture mode or enable Rider Model Lab first");
             return;
         }
         if (modelEventAccumulator.active) {
             server.send(409, "text/plain", "Wait for the active event capture to finish");
+            return;
+        }
+        if (operatingMode == OperatingMode::CAPTURE &&
+            modelPreEventCount < MODEL_PRE_EVENT_SAMPLES) {
+            server.send(409, "text/plain", "Capture buffer is warming up — wait two seconds");
             return;
         }
         beginCapturedModelEvent(millis());
@@ -1123,6 +1152,16 @@ void handleMode() {
     } else if (mode == "standby") {
         setOperatingMode(OperatingMode::STANDBY);
         server.send(200, "text/plain", "Controller STANDBY");
+    } else if (mode == "capture") {
+        if (!imuHealthy) {
+            server.send(409, "text/plain", "Cannot capture: IMU fault");
+            return;
+        }
+        setOperatingMode(OperatingMode::CAPTURE);
+        modelPreEventCount = 0;
+        modelPreEventHead = 0;
+        modelNextSampleMs = millis();
+        server.send(200, "text/plain", "Data Capture active — light output locked OFF");
     } else {
         server.send(400, "text/plain", "Invalid mode");
     }

@@ -21,7 +21,8 @@ def check_page(name: str) -> None:
 def main() -> None:
     check_page("DASHBOARD_HTML")
     check_page("SETTINGS_HTML")
-    print("Embedded dashboard and settings references passed")
+    check_page("CAPTURE_HTML")
+    print("Embedded dashboard, settings, and capture references passed")
 
 
 if __name__ == "__main__":

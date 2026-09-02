@@ -427,6 +427,7 @@ void registerWebRoutes() {
 
     server.on("/", HTTP_GET, handleRoot);
     server.on("/settings", HTTP_GET, handleSettingsPage);
+    server.on("/capture", HTTP_GET, handleCapturePage);
     server.on("/api/status", HTTP_GET, handleStatus);
     server.on("/api/model", HTTP_GET, handleRiderModel);
     server.on("/api/model/events.csv", HTTP_GET, handleRiderModelCsv);

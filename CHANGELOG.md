@@ -7,6 +7,21 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+## [0.15.1] - 2026-09-01
+
+### Added
+
+- Dedicated Data Capture dashboard with live controller, IMU, pitch, and saved
+  event status, a large event marker, and one-tap CSV download.
+- A distinct `CAPTURE` operating mode that samples the existing 50 Hz event
+  buffer while forcing the physical light output off.
+
+### Changed
+
+- Capture mode exits to Standby through both dashboard and physical-button
+  controls, and rejects event markers until its two-second buffer is ready.
+- Firmware version advanced to `v0.15.1`.
+
 ## [0.15.0] - 2026-08-31
 
 ### Added
