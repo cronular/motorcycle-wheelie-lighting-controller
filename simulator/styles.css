@@ -5,3 +5,4 @@
 @media(max-width:950px){.phone-card{grid-column:span 12}}
 .phone-card{grid-column:span 5}.settings-card{grid-column:span 7}.phone-shell{width:min(100%,430px)}.phone-shell iframe{height:876px}
 @media(max-width:950px){.phone-card,.settings-card{grid-column:span 12}}
+.phone-actions{grid-template-columns:repeat(3,1fr)}

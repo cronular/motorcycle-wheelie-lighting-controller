@@ -257,6 +257,7 @@ function setControllerMode(mode) {
     sim.baseline = sim.absolutePitch; sim.triggerPitch = 0; sim.baselineFrozen = false;
   }
   if (mode === "ARMED") startRideSession();
+  if (mode === "CAPTURE") sim.modelPreEventSamples = [];
   logEvent(`Controller → ${mode}`, mode === "ARMED" ? "good" : "");
 }
 
@@ -373,7 +374,7 @@ function simulationTick(dt) {
     sim.imu = $("imuHealthy").checked;
   }
   controllerStep(dt);
-  if (device.riderModelEnabled && sim.timeMs >= sim.nextModelSampleMs) {
+  if ((device.riderModelEnabled || sim.mode === "CAPTURE") && sim.timeMs >= sim.nextModelSampleMs) {
     sim.nextModelSampleMs = sim.timeMs + MODEL_SAMPLE_INTERVAL_MS;
     if (sim.mode === "ARMED" && sim.state === "NORMAL" && sim.imu &&
         modelAccelerationTrust() >= .8 && Math.abs(sim.gyro) < 2) {
@@ -679,7 +680,7 @@ async function handlePhoneRequest(rawUrl, options = {}) {
   if (url.pathname === "/api/mode") {
     const requested = url.searchParams.get("mode");
     if (requested === "armed" && !sim.imu) return bridgeResponse("Cannot arm: IMU fault", 409);
-    if (requested !== "armed" && requested !== "standby") return bridgeResponse("Invalid mode", 400);
+    if (requested !== "armed" && requested !== "standby" && requested !== "capture") return bridgeResponse("Invalid mode", 400);
     setControllerMode(requested.toUpperCase());
     return bridgeResponse(`Controller ${requested.toUpperCase()}`);
   }
@@ -694,7 +695,7 @@ async function handlePhoneRequest(rawUrl, options = {}) {
   if (url.pathname === "/api/model/feedback") {
     const label = url.searchParams.get("label");
     if (label === "missed") {
-      if (!device.riderModelEnabled) return bridgeResponse("Enable Rider Model Lab in Settings first", 409);
+      if (!device.riderModelEnabled && sim.mode !== "CAPTURE") return bridgeResponse("Enter Data Capture mode or enable Rider Model Lab first", 409);
       beginSimulatorModelEvent();
       sampleSimulatorModelEvent();
       const event = finishSimulatorModelEvent("missed", "missed");
@@ -768,12 +769,14 @@ window.wheelieSimulatorApi = {
   phoneReady(path) {
     $("phoneStatus").textContent = "CONNECTED";
     $("phoneDot").classList.add("connected");
-    $("phoneAddress").textContent = path.includes("settings") ? "wheelie.local/settings" : "wheelie.local";
+    $("phoneAddress").textContent = path.includes("settings") ? "wheelie.local/settings" : path.includes("capture") ? "wheelie.local/capture" : "wheelie.local";
     document.querySelectorAll("[data-phone-page]").forEach((button) => {
       const settingsPage = path.includes("/phone/settings");
+      const capturePage = path.includes("/phone/capture");
       button.classList.toggle("active", settingsPage
         ? button.dataset.phonePage.includes("settings")
-        : !button.dataset.phonePage.includes("settings"));
+        : capturePage ? button.dataset.phonePage.includes("capture")
+        : !button.dataset.phonePage.includes("settings") && !button.dataset.phonePage.includes("capture"));
     });
   }
 };
