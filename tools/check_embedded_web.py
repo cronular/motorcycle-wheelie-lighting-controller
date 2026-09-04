@@ -22,6 +22,12 @@ def main() -> None:
     check_page("DASHBOARD_HTML")
     check_page("SETTINGS_HTML")
     check_page("CAPTURE_HTML")
+    settings = embedded_html("SETTINGS_HTML").decode("utf-8")
+    for required in ("wizardOverlay", "Step 1 of 3", "Step 2 of 3", "Step 3 of 3"):
+        if required not in settings:
+            raise RuntimeError(f"SETTINGS_HTML is missing mounting wizard UI: {required}")
+    if "follow the OLED prompts" in settings:
+        raise RuntimeError("SETTINGS_HTML still directs the rider to the OLED")
     print("Embedded dashboard, settings, and capture references passed")
 
 
