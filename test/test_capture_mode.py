@@ -12,8 +12,8 @@ STORAGE = ROOT / "src" / "modules" / "storage_module.cpp"
 
 
 class CaptureModeTests(unittest.TestCase):
-    def test_release_version_is_0151(self) -> None:
-        self.assertIn('FIRMWARE_VERSION = "v0.15.1"', RUNTIME.read_text())
+    def test_release_version_is_0160(self) -> None:
+        self.assertIn('FIRMWARE_VERSION = "v0.16.0"', RUNTIME.read_text())
 
     def test_capture_is_a_distinct_operating_mode(self) -> None:
         runtime = RUNTIME.read_text()
