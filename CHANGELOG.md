@@ -7,6 +7,22 @@ All notable changes are documented here. The project follows
 
 Changes under active evaluation on the `testing` branch.
 
+## [0.16.0] - 2026-09-04
+
+### Added
+
+- Phone-guided mounting wizard with dedicated upright, side-to-side lean, and
+  level-calibration stages, progress feedback, retry handling, and screen wake
+  lock support where available.
+- Embedded-web regression coverage for the complete mounting wizard flow.
+
+### Changed
+
+- First-time mounting setup now waits until the web interface is available
+  instead of requiring the rider to follow instructions on the OLED during
+  boot. Safe default axes remain active until setup is saved.
+- Firmware version advanced to `v0.16.0`.
+
 ## [0.15.1] - 2026-09-01
 
 ### Added
@@ -119,6 +135,10 @@ work developed after v0.11.0.
 - Output defaults off, shuts down on sustained IMU failure, and remains off
   during firmware updates, calibration failures, and standby operation.
 
-[Unreleased]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.15.0...v0.16.0
+[0.15.1]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/compare/v0.11.0...v0.13.0
 [0.11.0]: https://github.com/cronular/motorcycle-wheelie-lighting-controller/releases/tag/v0.11.0
