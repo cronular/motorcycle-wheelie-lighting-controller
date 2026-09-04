@@ -553,10 +553,10 @@ void beginSensor() {
     writeMPURegister(GYRO_CONFIG, 0x00);
 
     if (!orientationConfigured) {
-        Serial.println("No saved mounting orientation; starting first-setup wizard.");
-        if (!runOrientationWizard()) {
-            Serial.println("Using safe default axes until the wizard is completed in Settings.");
-        }
+        // Wi-Fi is not available yet, so defer the rider-guided procedure to
+        // the web interface instead of forcing first setup onto the OLED.
+        Serial.println("No saved mounting orientation; complete Mounting Setup in the web interface.");
+        Serial.println("Using safe default axes until web setup is complete.");
     } else {
         Serial.printf("Saved orientation: vertical=%s roll=%s pitch=%s\n",
                       getAxisName(verticalAxis), getAxisName(rollAxis),

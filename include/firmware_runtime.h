@@ -40,7 +40,7 @@ namespace firmware {
 // FIRMWARE
 // =====================================================
 
-constexpr const char* FIRMWARE_VERSION = "v0.15.0";
+constexpr const char* FIRMWARE_VERSION = "v0.15.1";
 constexpr const char* TARGET_BOARD_ID = "seeed_xiao_esp32s3";
 constexpr const char* TARGET_CHIP_ID = "esp32s3";
 
@@ -243,7 +243,8 @@ struct MPUData {
 
 enum class OperatingMode {
     ARMED,
-    STANDBY
+    STANDBY,
+    CAPTURE
 };
 
 enum class DisplayPage {

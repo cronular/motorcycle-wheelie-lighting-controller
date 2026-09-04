@@ -7,7 +7,7 @@ from pathlib import Path
 import os
 import shutil
 
-from run_simulator import PHONE_DASHBOARD, PHONE_SETTINGS, PROJECT_DIR, SIMULATOR_DIR
+from run_simulator import PHONE_CAPTURE, PHONE_DASHBOARD, PHONE_SETTINGS, PROJECT_DIR, SIMULATOR_DIR
 
 
 def build(output: Path) -> None:
@@ -20,9 +20,12 @@ def build(output: Path) -> None:
     shutil.copytree(SIMULATOR_DIR, output)
     phone = output / "phone"
     settings = phone / "settings"
+    capture = phone / "capture"
     settings.mkdir(parents=True)
+    capture.mkdir(parents=True)
     (phone / "index.html").write_bytes(PHONE_DASHBOARD)
     (settings / "index.html").write_bytes(PHONE_SETTINGS)
+    (capture / "index.html").write_bytes(PHONE_CAPTURE)
 
 
 def verify(output: Path) -> None:
@@ -31,13 +34,19 @@ def verify(output: Path) -> None:
     settings = (output / "phone" / "settings" / "index.html").read_text(
         encoding="utf-8"
     )
+    capture = (output / "phone" / "capture" / "index.html").read_text(
+        encoding="utf-8"
+    )
     checks = {
         "relative phone iframe": 'src="phone/"' in lab,
         "phone API bridge": "wheelieSimulatorApi" in dashboard,
         "relative settings link": 'href="settings/"' in dashboard,
+        "relative capture link": 'href="capture/"' in dashboard,
         "relative dashboard link": 'href="../"' in settings,
         "rider HUD": "Rider HUD" in dashboard,
         "settings page": "Controller Settings" in settings,
+        "capture page": "Data Capture" in capture,
+        "capture event button": 'id="eventBtn"' in capture,
     }
     failed = [name for name, passed in checks.items() if not passed]
     if failed:

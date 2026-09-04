@@ -13,7 +13,12 @@ const char* getStateName() {
 }
 
 const char* getModeName() {
-    return operatingMode == OperatingMode::ARMED ? "ARMED" : "STANDBY";
+    switch (operatingMode) {
+        case OperatingMode::ARMED: return "ARMED";
+        case OperatingMode::CAPTURE: return "CAPTURE";
+        case OperatingMode::STANDBY: return "STANDBY";
+    }
+    return "STANDBY";
 }
 
 const char* getAngleModeName() {
@@ -111,6 +116,9 @@ void setOperatingMode(OperatingMode mode) {
 
 void toggleOperatingMode() {
     if (operatingMode == OperatingMode::ARMED) {
+        setOperatingMode(OperatingMode::STANDBY);
+        Serial.println("MODE -> STANDBY");
+    } else if (operatingMode == OperatingMode::CAPTURE) {
         setOperatingMode(OperatingMode::STANDBY);
         Serial.println("MODE -> STANDBY");
     } else {

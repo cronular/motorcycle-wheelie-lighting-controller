@@ -91,6 +91,7 @@ void rotateWriteToken();
 String generateUniqueWiFiPassword();
 void handleRoot();
 void handleSettingsPage();
+void handleCapturePage();
 void handleCaptivePortalRedirect();
 void handleStatus();
 void handleRiderModel();
