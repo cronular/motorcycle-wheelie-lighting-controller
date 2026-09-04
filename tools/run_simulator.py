@@ -48,6 +48,15 @@ PHONE_BRIDGE = r"""
       const api = await bridge();
       api.phoneReady(window.location.pathname);
     } catch (error) {}
+    document.querySelectorAll('a[download][href^="/api/"]').forEach(link => link.addEventListener('click', async event => {
+      event.preventDefault();
+      const response = await window.fetch(link.getAttribute('href'));
+      const blob = await response.blob(), download = document.createElement('a');
+      download.href = URL.createObjectURL(blob);
+      download.download = link.getAttribute('download') || 'capture.csv';
+      download.click();
+      setTimeout(() => URL.revokeObjectURL(download.href), 1000);
+    }));
   });
 })();
 </script>
@@ -70,6 +79,7 @@ def phone_page(name: str) -> bytes:
     page = embedded_html(name).replace("</head>", PHONE_BRIDGE + "</head>")
     if name == "DASHBOARD_HTML":
         page = page.replace('href="/settings"', 'href="settings/"')
+        page = page.replace('href="/capture"', 'href="capture/"')
     else:
         page = page.replace('href="/"', 'href="../"')
     return page.encode("utf-8")
@@ -77,6 +87,7 @@ def phone_page(name: str) -> bytes:
 
 PHONE_DASHBOARD = phone_page("DASHBOARD_HTML")
 PHONE_SETTINGS = phone_page("SETTINGS_HTML")
+PHONE_CAPTURE = phone_page("CAPTURE_HTML")
 
 
 class SimulatorHandler(SimpleHTTPRequestHandler):
@@ -98,6 +109,9 @@ class SimulatorHandler(SimpleHTTPRequestHandler):
             return
         if path in ("/phone/settings", "/phone/settings/"):
             self.send_phone_page(PHONE_SETTINGS)
+            return
+        if path in ("/phone/capture", "/phone/capture/"):
+            self.send_phone_page(PHONE_CAPTURE)
             return
         super().do_GET()
 
@@ -145,6 +159,7 @@ def main():
                     "http-200": response.status == 200,
                     "api-bridge": "wheelieSimulatorApi" in body,
                     "settings-link": 'href="settings/"' in body,
+                    "capture-link": 'href="capture/"' in body,
                     "rider-hud": "Rider HUD" in body,
                     "lean-gauge": 'id="leanGauge"' in body,
                 }
@@ -164,6 +179,17 @@ def main():
                 missing = [name for name, passed in checks.items() if not passed]
                 if missing:
                     raise SystemExit("Phone settings bridge smoke test failed: " + ", ".join(missing))
+            with urllib.request.urlopen(url + "phone/capture", timeout=3) as response:
+                body = response.read().decode("utf-8")
+                checks = {
+                    "http-200": response.status == 200,
+                    "capture-title": "Data Capture" in body,
+                    "event-button": 'id="eventBtn"' in body,
+                    "api-bridge": "wheelieSimulatorApi" in body,
+                }
+                missing = [name for name, passed in checks.items() if not passed]
+                if missing:
+                    raise SystemExit("Phone capture bridge smoke test failed: " + ", ".join(missing))
         finally:
             server.shutdown()
             server.server_close()

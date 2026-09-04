@@ -202,7 +202,7 @@ void finalizeCapturedModelEvent(uint32_t now) {
 
 void updateRiderModel() {
     const uint32_t now = millis();
-    if (!riderModelEnabled) {
+    if (!riderModelEnabled && operatingMode != OperatingMode::CAPTURE) {
         modelPreviousControllerState = controllerState;
         return;
     }
